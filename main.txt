@@ -1,0 +1,4349 @@
+=== File: src/app/alerts/page.tsx ===
+'use client';
+
+import AlertSystem from '@/components/AlertSystem';
+import Link from 'next/link';
+import { ArrowLeft } from 'lucide-react';
+
+export default function AlertsPage() {
+  return (
+    <div className="min-h-screen bg-slate-900 text-white p-6">
+      <div className="max-w-6xl mx-auto">
+        {/* Back Button */}
+        <Link 
+          href="/dashboard"
+          className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300 mb-6"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back to Dashboard
+        </Link>
+
+        <AlertSystem />
+      </div>
+    </div>
+  );
+}=== File: src/app/api/auth/login/logout/route.ts ===
+// app/api/auth/logout/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { deleteSession, logActivity, validateSession } from '../../../../../lib/auth';
+
+export async function POST(request: NextRequest) {
+  try {
+    const token = request.cookies.get('session_token')?.value;
+    
+    if (token) {
+      // Get user before deleting session for logging
+      const user = validateSession(token);
+      
+      // Delete session
+      deleteSession(token);
+      
+      // Log logout
+      if (user) {
+        logActivity(
+          user.id,
+          'LOGOUT',
+          'User logged out',
+          request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
+        );
+      }
+    }
+    
+    // Clear session cookie
+    const response = NextResponse.json(
+      { success: true, message: 'Logged out successfully' },
+      { status: 200 }
+    );
+    
+    response.cookies.delete('session_token');
+    
+    return response;
+  } catch (error) {
+    console.error('Logout error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}=== File: src/app/api/auth/login/route.ts ===
+// app/api/auth/login/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { authenticateUser, createSession, logActivity } from '../../../../lib/auth';
+import { seedSampleUsers } from '../../../../lib/db';
+
+// Ensure sample users exist
+try {
+  seedSampleUsers();
+} catch (error) {
+  console.error('Error seeding users:', error);
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const { username, password } = await request.json();
+    
+    if (!username || !password) {
+      return NextResponse.json(
+        { error: 'Username and password are required' },
+        { status: 400 }
+      );
+    }
+    
+    // Authenticate user
+    const user = authenticateUser(username, password);
+    
+    if (!user) {
+      // Log failed attempt
+      logActivity(
+        null,
+        'LOGIN_FAILED',
+        `Failed login attempt for username: ${username}`,
+        request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
+      );
+      
+      return NextResponse.json(
+        { error: 'Invalid username or password' },
+        { status: 401 }
+      );
+    }
+    
+    // Create session
+    const token = createSession(user.id);
+    
+    // Log successful login
+    logActivity(
+      user.id,
+      'LOGIN_SUCCESS',
+      `User logged in successfully`,
+      request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
+    );
+    
+    // Set session cookie
+    const response = NextResponse.json(
+      {
+        success: true,
+        user: {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+          name: user.name,
+          email: user.email,
+          organization: user.organization,
+        },
+      },
+      { status: 200 }
+    );
+    
+    response.cookies.set('session_token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 60 * 60 * 24 * 7, // 7 days
+      path: '/',
+    });
+    
+    return response;
+  } catch (error) {
+    console.error('Login error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}=== File: src/app/api/auth/login/session/route.ts ===
+// app/api/auth/session/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { validateSession } from '../../../../../lib/auth';
+
+export async function GET(request: NextRequest) {
+  try {
+    const token = request.cookies.get('session_token')?.value;
+    
+    if (!token) {
+      return NextResponse.json(
+        { error: 'No session token' },
+        { status: 401 }
+      );
+    }
+    
+    const user = validateSession(token);
+    
+    if (!user) {
+      return NextResponse.json(
+        { error: 'Invalid or expired session' },
+        { status: 401 }
+      );
+    }
+    
+    return NextResponse.json(
+      {
+        success: true,
+        user: {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+          name: user.name,
+          email: user.email,
+          organization: user.organization,
+        },
+      },
+      { status: 200 }
+    );
+  } catch (error) {
+    console.error('Session validation error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}=== File: src/app/api/responder/route.ts ===
+import { NextRequest, NextResponse } from 'next/server';
+import fs from 'fs-extra';
+import path from 'path';
+import { io } from '../socket/route';
+
+const dataPath = path.join(process.cwd(), 'data/responders.json');  // Store in data folder
+
+// Ensure data folder exists
+const dataDir = path.dirname(dataPath);
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir);
+}
+
+// Load data
+function loadData(): Array<{
+  id: string;
+  status: 'standby' | 'active';
+  location: { lat: number; lng: number } | null;
+  updatedAt: string;
+}> {
+  if (fs.existsSync(dataPath)) {
+    return fs.readJsonSync(dataPath);
+  }
+  return [
+    { id: 'FR-101', status: 'standby', location: null, updatedAt: new Date().toISOString() },
+    { id: 'FR-102', status: 'active', location: null, updatedAt: new Date().toISOString() },
+    { id: 'FR-103', status: 'standby', location: null, updatedAt: new Date().toISOString() },
+    { id: 'FR-104', status: 'active', location: null, updatedAt: new Date().toISOString() },
+  ];
+}
+
+// Save data
+function saveData(data: any[]) {
+  fs.writeJsonSync(dataPath, data, { spaces: 2 });
+}
+
+export async function GET() {
+  return NextResponse.json(loadData());
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { id, status, location } = body;
+
+    if (!id) {
+      return NextResponse.json({ error: 'ID required' }, { status: 400 });
+    }
+
+    let data = loadData();
+    const index = data.findIndex(r => r.id === id);
+    const update = {
+      id,
+      status: status as 'standby' | 'active',
+      location: location || null,
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (index > -1) {
+      data[index] = update;
+    } else {
+      data.push(update);
+    }
+
+    saveData(data);  // Persist to file
+    // Emit to Socket.io
+    if (io) {
+        io.emit('responderUpdate', update);  // Fixed: use io directly
+    }
+
+    console.log('Updated responder:', update);
+
+    return NextResponse.json({ success: true, data: update });
+    } catch (error) {
+    return NextResponse.json({ error: 'Invalid data' }, { status: 400 });
+    }
+}=== File: src/app/api/socket/route.ts ===
+import { NextRequest } from 'next/server';
+import { Server } from 'socket.io';
+import { createServer } from 'http';
+
+// Global Socket.io server (prototype; use in production with proper setup)
+let io: Server | null = null;
+
+export async function GET(request: NextRequest) {
+  if (!io) {
+    const httpServer = createServer();
+    io = new Server(httpServer, { cors: { origin: '*' } });
+    httpServer.listen(4000);  // Separate port for Socket.io
+
+    io.on('connection', (socket) => {
+      console.log('Client connected:', socket.id);
+      socket.on('disconnect', () => console.log('Client disconnected:', socket.id));
+    });
+  }
+
+  return new Response('Socket.io ready', { status: 200 });
+}
+
+// Export for API use
+export { io };=== File: src/app/dashboard/page.tsx ===
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import ProtectedRoute from '../../components/ProtectedRoute';
+import Navigation from '../../components/Navigation';
+import { useAuth } from '../../lib/AuthContext';
+import Link from 'next/link';
+import {
+  Activity,
+  Ambulance,
+  Building2,
+  Users,
+  AlertCircle,
+  TrendingUp,
+  MapPin,
+  Clock,
+  ArrowRight,
+  Bell,
+  Radio,
+} from 'lucide-react';
+import AlertSystem from '../../components/AlertSystem';
+import { getHospitalData, onHospitalDataChange } from '../../lib/hospitalDataStore';
+import { getResourceRequests, onRequestDataChange } from '../../lib/resourceRequestStore';
+
+export default function DashboardPage() {
+  const { user } = useAuth();
+  const [hospitals, setHospitals] = useState(getHospitalData());
+  const [resourceRequests, setResourceRequests] = useState(getResourceRequests());
+
+  useEffect(() => {
+    const unsubscribeHospitals = onHospitalDataChange(() => {
+      setHospitals(getHospitalData());
+    });
+    const unsubscribeRequests = onRequestDataChange((updated) => {
+      setResourceRequests(updated);
+    });
+    return () => {
+      unsubscribeHospitals();
+      unsubscribeRequests();
+    };
+  }, []);
+
+  // Calculate key metrics
+  const totalBeds = hospitals.reduce((sum, h) => sum + (h.availableBeds || 0), 0);
+  const totalICU = hospitals.reduce((sum, h) => sum + (h.availableICU || 0), 0);
+  const totalVentilators = hospitals.reduce((sum, h) => sum + (h.ventilators || 0), 0);
+  const criticalRequests = resourceRequests.filter((r) => r.priority === 'Critical').length;
+
+  const [ambulances] = useState([
+    { id: 'AMB-001', status: 'available', location: 'Station 1' },
+    { id: 'AMB-002', status: 'en-route', location: 'Main St & 5th Ave' },
+    { id: 'AMB-003', status: 'on-scene', location: 'City Park' },
+    { id: 'AMB-004', status: 'available', location: 'Station 2' },
+  ]);
+
+  const availableAmbulances = ambulances.filter((a) => a.status === 'available').length;
+  const activeAmbulances = ambulances.filter((a) => a.status !== 'available').length;
+
+  const [recentActivity] = useState([
+    { id: 1, time: '2 min ago', event: 'Ambulance AMB-002 dispatched', type: 'dispatch', icon: Ambulance },
+    { id: 2, time: '5 min ago', event: 'Hospital capacity updated', type: 'update', icon: Building2 },
+    { id: 3, time: '8 min ago', event: 'First responder Unit Alpha responded', type: 'response', icon: Users },
+    { id: 4, time: '12 min ago', event: 'New alert issued by dispatch', type: 'alert', icon: AlertCircle },
+  ]);
+
+  const quickActions = [
+    {
+      title: 'View Full Map',
+      description: 'See all responders and incidents',
+      href: '/map',
+      icon: MapPin,
+      color: 'blue',
+      show: user?.role === 'admin' || user?.role === 'dispatcher' || user?.role === 'first_responder',
+    },
+    {
+      title: 'Manage Hospitals',
+      description: 'Update hospital resources',
+      href: '/hospital-resources',
+      icon: Building2,
+      color: 'emerald',
+      show: user?.role === 'admin' || user?.role === 'hospital_worker' || user?.role === 'dispatcher',
+    },
+    {
+      title: 'Review Requests',
+      description: 'Approve resource requests',
+      href: '/resource-review',
+      icon: AlertCircle,
+      color: 'purple',
+      show: user?.role === 'admin' || user?.role === 'dispatcher',
+    },
+    {
+      title: 'Send Alerts',
+      description: 'Issue government alerts',
+      href: '/alerts',
+      icon: Bell,
+      color: 'red',
+      show: user?.role === 'admin' || user?.role === 'dispatcher',
+    },
+  ].filter((action) => action.show);
+
+  return (
+    <ProtectedRoute requiredPermissions={['canAccessDashboard']}>
+      <div className="min-h-screen bg-slate-900">
+        <Navigation />
+
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          {/* Welcome Section */}
+          <div className="mb-8">
+            <h1 className="text-3xl font-bold text-white mb-2">
+              Welcome back, {user?.name || 'User'}
+            </h1>
+            <p className="text-slate-400">Real-time crisis management and coordination</p>
+          </div>
+
+          {/* Key Metrics */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+            <div className="bg-gradient-to-br from-blue-600 to-blue-700 rounded-xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-4">
+                <Ambulance className="w-8 h-8 text-white" />
+                <TrendingUp className="w-5 h-5 text-blue-200" />
+              </div>
+              <div className="text-3xl font-bold text-white mb-1">{availableAmbulances}</div>
+              <p className="text-blue-100 text-sm">Available Ambulances</p>
+              <p className="text-blue-200 text-xs mt-2">{activeAmbulances} currently active</p>
+            </div>
+
+            <div className="bg-gradient-to-br from-emerald-600 to-emerald-700 rounded-xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-4">
+                <Building2 className="w-8 h-8 text-white" />
+                <TrendingUp className="w-5 h-5 text-emerald-200" />
+              </div>
+              <div className="text-3xl font-bold text-white mb-1">{totalBeds}</div>
+              <p className="text-emerald-100 text-sm">Available Hospital Beds</p>
+              <p className="text-emerald-200 text-xs mt-2">{totalICU} ICU beds available</p>
+            </div>
+
+            <div className="bg-gradient-to-br from-purple-600 to-purple-700 rounded-xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-4">
+                <Activity className="w-8 h-8 text-white" />
+                <TrendingUp className="w-5 h-5 text-purple-200" />
+              </div>
+              <div className="text-3xl font-bold text-white mb-1">{totalVentilators}</div>
+              <p className="text-purple-100 text-sm">Ventilators Available</p>
+              <p className="text-purple-200 text-xs mt-2">Across {hospitals.length} hospitals</p>
+            </div>
+
+            <div className="bg-gradient-to-br from-red-600 to-red-700 rounded-xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-4">
+                <AlertCircle className="w-8 h-8 text-white" />
+                <Bell className="w-5 h-5 text-red-200 animate-pulse" />
+              </div>
+              <div className="text-3xl font-bold text-white mb-1">{criticalRequests}</div>
+              <p className="text-red-100 text-sm">Critical Requests</p>
+              <p className="text-red-200 text-xs mt-2">{resourceRequests.length} total pending</p>
+            </div>
+          </div>
+
+          {/* Government Alerts - Compact View */}
+          <div className="mb-8">
+            <AlertSystem />
+          </div>
+
+          {/* Two Column Layout */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+            {/* Quick Actions */}
+            <div className="bg-slate-800 rounded-xl p-6 shadow-xl border border-slate-700">
+              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                <Activity className="w-5 h-5 text-blue-400" />
+                Quick Actions
+              </h2>
+              <div className="grid grid-cols-1 gap-3">
+                {quickActions.map((action) => {
+                  const Icon = action.icon;
+                  return (
+                    <Link
+                      key={action.title}
+                      href={action.href}
+                      className={`bg-slate-700/50 hover:bg-slate-700 border border-${action.color}-600/30 rounded-lg p-4 transition-all group`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className={`bg-${action.color}-600 p-2 rounded-lg`}>
+                            <Icon className="w-5 h-5 text-white" />
+                          </div>
+                          <div>
+                            <h3 className="font-semibold text-white">{action.title}</h3>
+                            <p className="text-sm text-slate-400">{action.description}</p>
+                          </div>
+                        </div>
+                        <ArrowRight className="w-5 h-5 text-slate-500 group-hover:text-white transition-colors" />
+                      </div>
+                    </Link>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Recent Activity */}
+            <div className="bg-slate-800 rounded-xl p-6 shadow-xl border border-slate-700">
+              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                <Clock className="w-5 h-5 text-amber-400" />
+                Recent Activity
+              </h2>
+              <div className="space-y-3">
+                {recentActivity.map((activity) => {
+                  const Icon = activity.icon;
+                  return (
+                    <div
+                      key={activity.id}
+                      className="bg-slate-700/50 rounded-lg p-3 flex items-start gap-3"
+                    >
+                      <div className="bg-slate-600 p-2 rounded-lg">
+                        <Icon className="w-4 h-4 text-slate-300" />
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-white text-sm font-medium">{activity.event}</p>
+                        <p className="text-slate-400 text-xs mt-1">{activity.time}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <Link
+                href="/activity-log"
+                className="mt-4 block text-center text-blue-400 hover:text-blue-300 text-sm font-medium"
+              >
+                View full activity log →
+              </Link>
+            </div>
+          </div>
+
+          {/* Critical Alerts Section */}
+          {resourceRequests.length > 0 && (
+            <div className="bg-red-900/30 border-l-4 border-red-600 rounded-lg shadow-lg p-6">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-3">
+                  <AlertCircle className="w-6 h-6 text-red-400" />
+                  <div>
+                    <h3 className="text-lg font-semibold text-red-100">
+                      Pending Resource Requests
+                    </h3>
+                    <p className="text-red-300 text-sm">Requires immediate attention</p>
+                  </div>
+                </div>
+                <Link
+                  href="/resource-review"
+                  className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors"
+                >
+                  Review All →
+                </Link>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {resourceRequests.slice(0, 4).map((req) => (
+                  <div
+                    key={req.id}
+                    className="bg-slate-800/50 rounded-lg p-3 flex justify-between items-center"
+                  >
+                    <div>
+                      <span className="font-semibold text-white">{req.hospitalName}</span>
+                      <span className="text-slate-400 text-sm ml-2">
+                        needs {req.quantity} {req.resourceType}
+                      </span>
+                      <span
+                        className={`ml-2 px-2 py-0.5 rounded text-xs font-bold ${
+                          req.priority === 'Critical'
+                            ? 'bg-red-600'
+                            : req.priority === 'High'
+                            ? 'bg-orange-600'
+                            : 'bg-blue-600'
+                        } text-white`}
+                      >
+                        {req.priority}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </ProtectedRoute>
+  );
+}=== File: src/app/hospital-resources/page.tsx ===
+'use client';
+
+import React from 'react';
+import HospitalResourceForm from '@/components/HospitalResourceForm';
+import HospitalResourcePanel from '@/components/HospitalResourcePanel';
+import Link from 'next/link';
+import { ArrowLeft } from 'lucide-react';
+
+export default function HospitalResourcesPage() {
+  return (
+    <div className="min-h-screen bg-slate-900 text-white p-6">
+      <div className="max-w-7xl mx-auto space-y-4">
+        {/* Back Button */}
+        <Link 
+          href="/dashboard"
+          className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300 mb-4"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back to Dashboard
+        </Link>
+
+        <h1 className="text-3xl font-bold mb-2 text-emerald-400">
+          Manage Hospital Resources
+        </h1>
+        <p className="text-slate-400 mb-6">
+          Add or update hospital information including bed capacity, ICU availability, and ventilators.
+        </p>
+
+        {/* Grid Layout: Form on left, Panel on right */}
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr,2fr] gap-6">
+          {/* Resource Form */}
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-5 shadow-lg">
+            <HospitalResourceForm />
+          </div>
+
+          {/* Resource Overview Panel */}
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-5 shadow-lg">
+            <HospitalResourcePanel />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}=== File: src/app/layout.tsx ===
+import type { Metadata } from "next";
+import { Inter } from 'next/font/google';
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import { AuthProvider } from "src/lib/AuthContext";
+
+const inter = Inter({ subsets: ['latin'] });
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: 'Crisis Management Dashboard',
+  description: 'Real-time coordination and monitoring system',
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body>
+        <AuthProvider>
+          {children}
+        </AuthProvider>
+      </body>
+    </html>
+  );
+}=== File: src/app/login/page.tsx ===
+// app/login/page.tsx
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { useAuth } from '../../lib/AuthContext';
+import { useRouter } from 'next/navigation';
+import { Shield, AlertCircle, Eye, EyeOff, User, Lock } from 'lucide-react';
+
+export default function LoginPage() {
+  const { user, login, loading } = useAuth();
+  const router = useRouter();
+  const [formData, setFormData] = useState({
+    username: '',
+    password: '',
+  });
+  const [error, setError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [showCredentials, setShowCredentials] = useState(false);
+
+  // Redirect if already logged in
+  useEffect(() => {
+    if (!loading && user) {
+      router.push('/dashboard');
+    }
+  }, [user, loading, router]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setIsLoading(true);
+
+    try {
+      await login(formData.username, formData.password);
+    } catch (err: any) {
+      setError(err.message || 'Invalid username or password');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setFormData((prev) => ({
+      ...prev,
+      [e.target.name]: e.target.value,
+    }));
+  };
+
+  const quickLogin = (username: string, password: string) => {
+    setFormData({ username, password });
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 flex items-center justify-center">
+        <div className="text-white text-xl">Loading...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 flex items-center justify-center p-4">
+      <div className="max-w-md w-full space-y-6">
+        {/* Header */}
+        <div className="text-center">
+          <div className="flex justify-center mb-4">
+            <div className="bg-blue-600 p-4 rounded-full">
+              <Shield className="w-12 h-12 text-white" />
+            </div>
+          </div>
+          <h1 className="text-4xl font-bold text-white mb-2">Crisis Management</h1>
+          <p className="text-slate-300">Real-time Coordination System</p>
+        </div>
+
+        {/* Login Form */}
+        <div className="bg-slate-800/50 backdrop-blur-lg rounded-2xl shadow-2xl p-8 border border-slate-700">
+          <form onSubmit={handleSubmit} className="space-y-6">
+            {/* Error Message */}
+            {error && (
+              <div className="bg-red-900/50 border border-red-600 rounded-lg p-3 flex items-center gap-2 text-red-200">
+                <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                <span className="text-sm">{error}</span>
+              </div>
+            )}
+
+            {/* Username Field */}
+            <div>
+              <label htmlFor="username" className="block text-sm font-medium text-slate-300 mb-2">
+                Username
+              </label>
+              <div className="relative">
+                <User className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-slate-400" />
+                <input
+                  id="username"
+                  name="username"
+                  type="text"
+                  value={formData.username}
+                  onChange={handleChange}
+                  className="w-full pl-10 pr-4 py-3 bg-slate-700/50 border border-slate-600 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  placeholder="Enter your username"
+                  required
+                  autoComplete="username"
+                />
+              </div>
+            </div>
+
+            {/* Password Field */}
+            <div>
+              <label htmlFor="password" className="block text-sm font-medium text-slate-300 mb-2">
+                Password
+              </label>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-slate-400" />
+                <input
+                  id="password"
+                  name="password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={formData.password}
+                  onChange={handleChange}
+                  className="w-full pl-10 pr-12 py-3 bg-slate-700/50 border border-slate-600 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  placeholder="Enter your password"
+                  required
+                  autoComplete="current-password"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 transform -translate-y-1/2 text-slate-400 hover:text-slate-300"
+                >
+                  {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                </button>
+              </div>
+            </div>
+
+            {/* Submit Button */}
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-800 text-white font-semibold py-3 rounded-lg transition-colors flex items-center justify-center gap-2"
+            >
+              {isLoading ? (
+                <>
+                  <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Logging in...
+                </>
+              ) : (
+                <>
+                  <Shield className="w-5 h-5" />
+                  Sign In
+                </>
+              )}
+            </button>
+          </form>
+        </div>
+
+        {/* Sample Credentials */}
+        <div className="bg-slate-800/50 backdrop-blur-lg rounded-2xl shadow-xl p-6 border border-slate-700">
+          <button
+            onClick={() => setShowCredentials(!showCredentials)}
+            className="w-full flex items-center justify-between text-slate-300 hover:text-white transition-colors"
+          >
+            <span className="font-semibold">Sample Login Credentials</span>
+            <span className="text-sm">{showCredentials ? '▼' : '▶'}</span>
+          </button>
+          
+          {showCredentials && (
+            <div className="mt-4 space-y-3">
+              {[
+                { role: 'Administrator', username: 'admin', password: 'admin123', color: 'red' },
+                { role: 'Dispatcher', username: 'dispatcher1', password: 'dispatch123', color: 'yellow' },
+                { role: 'Hospital Worker', username: 'hospital1', password: 'hospital123', color: 'emerald' },
+                { role: 'First Responder', username: 'responder1', password: 'respond123', color: 'purple' },
+                { role: 'General User', username: 'user1', password: 'user123', color: 'blue' },
+              ].map((cred) => (
+                <button
+                  key={cred.username}
+                  onClick={() => quickLogin(cred.username, cred.password)}
+                  className={`w-full text-left bg-slate-700/50 hover:bg-slate-700 border border-${cred.color}-600/30 rounded-lg p-3 transition-colors`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className={`text-${cred.color}-400 font-semibold text-sm`}>{cred.role}</span>
+                    <span className="text-xs text-slate-500">Click to use</span>
+                  </div>
+                  <div className="text-xs text-slate-400 font-mono">
+                    {cred.username} / {cred.password}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <p className="text-center text-slate-500 text-sm">
+          © 2025 Crisis Management System. All rights reserved.
+        </p>
+      </div>
+    </div>
+  );
+}=== File: src/app/map/page.tsx ===
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import ProtectedRoute from '../../components/ProtectedRoute';
+import Navigation from '../../components/Navigation';
+import dynamic from 'next/dynamic';
+import { MapPin, Users, Activity, Filter, Search } from 'lucide-react';
+import StatusBadge from '../../components/StatusBadge';
+
+// Dynamically import map component
+const ResponderMap = dynamic(() => import('../../components/ResponderMap'), { ssr: false });
+
+export default function MapPage() {
+  const [firstResponders, setFirstResponders] = useState([
+    { id: 'FR-101', name: 'Unit Alpha', type: 'Fire', status: 'standby', location: 'Downtown', coords: { lat: 33.7490, lng: -84.3880 } },
+    { id: 'FR-102', name: 'Unit Bravo', type: 'Police', status: 'active', location: 'North District', coords: { lat: 33.8958, lng: -84.3014 } },
+    { id: 'FR-103', name: 'Unit Charlie', type: 'Fire', status: 'standby', location: 'Station 3', coords: { lat: 33.6407, lng: -84.4277 } },
+    { id: 'FR-104', name: 'Unit Delta', type: 'Police', status: 'active', location: 'Highway 5', coords: { lat: 33.7550, lng: -84.4000 } },
+  ]);
+
+  const [filterType, setFilterType] = useState<'all' | 'Fire' | 'Police'>('all');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'standby'>('all');
+  const [searchQuery, setSearchQuery] = useState('');
+
+  // Load responder statuses from localStorage
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const loadedResponders = firstResponders.map(r => ({
+        ...r,
+        status: (localStorage.getItem(`responder_${r.id.toLowerCase()}_status`) as 'active' | 'standby') || r.status
+      }));
+      setFirstResponders(loadedResponders);
+    }
+  }, []);
+
+  // Auto-update on storage change
+  useEffect(() => {
+    const handleUpdate = () => {
+      setFirstResponders(prev => prev.map(r => ({
+        ...r,
+        status: (localStorage.getItem(`responder_${r.id.toLowerCase()}_status`) as 'active' | 'standby') || r.status
+      })));
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('storage', handleUpdate);
+      window.addEventListener('focus', handleUpdate);
+
+      return () => {
+        window.removeEventListener('storage', handleUpdate);
+        window.removeEventListener('focus', handleUpdate);
+      };
+    }
+  }, []);
+
+  // Filter responders
+  const filteredResponders = firstResponders.filter(r => {
+    const typeMatch = filterType === 'all' || r.type === filterType;
+    const statusMatch = filterStatus === 'all' || r.status === filterStatus;
+    const searchMatch = searchQuery === '' || 
+      r.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.location.toLowerCase().includes(searchQuery.toLowerCase());
+    return typeMatch && statusMatch && searchMatch;
+  });
+
+  const activeCount = firstResponders.filter(r => r.status === 'active').length;
+  const standbyCount = firstResponders.filter(r => r.status === 'standby').length;
+
+  return (
+    <ProtectedRoute requiredPermissions={['canViewMap']}>
+      <div className="min-h-screen bg-slate-900">
+        <Navigation />
+
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          {/* Header */}
+          <div className="mb-6">
+            <h1 className="text-3xl font-bold text-white mb-2 flex items-center gap-3">
+              <MapPin className="w-8 h-8 text-blue-500" />
+              Live Map View
+            </h1>
+            <p className="text-slate-400">Real-time first responder locations and status</p>
+          </div>
+
+          {/* Stats Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 mb-6">
+            <div className="bg-gradient-to-br from-blue-600 to-blue-700 rounded-xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-3">
+                <Users className="w-8 h-8 text-white" />
+                <Activity className="w-5 h-5 text-blue-200" />
+              </div>
+              <div className="text-3xl font-bold text-white mb-1">{firstResponders.length}</div>
+              <p className="text-blue-100 text-sm">Total Responders</p>
+            </div>
+
+            <div className="bg-gradient-to-br from-green-600 to-green-700 rounded-xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-3">
+                <Users className="w-8 h-8 text-white" />
+                <div className="bg-green-500 w-3 h-3 rounded-full animate-pulse"></div>
+              </div>
+              <div className="text-3xl font-bold text-white mb-1">{activeCount}</div>
+              <p className="text-green-100 text-sm">Active Units</p>
+            </div>
+
+            <div className="bg-gradient-to-br from-yellow-600 to-yellow-700 rounded-xl p-6 shadow-lg">
+              <div className="flex items-center justify-between mb-3">
+                <Users className="w-8 h-8 text-white" />
+                <div className="bg-yellow-500 w-3 h-3 rounded-full"></div>
+              </div>
+              <div className="text-3xl font-bold text-white mb-1">{standbyCount}</div>
+              <p className="text-yellow-100 text-sm">Standby Units</p>
+            </div>
+          </div>
+
+          {/* Map and Responders Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Map Section */}
+            <div className="lg:col-span-2 bg-slate-800 rounded-xl p-6 shadow-xl border border-slate-700">
+              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                <MapPin className="w-5 h-5 text-blue-400" />
+                Responder Locations
+              </h2>
+              <div className="h-[500px] rounded-lg overflow-hidden">
+                <ResponderMap responders={filteredResponders} />
+              </div>
+            </div>
+
+            {/* Responders List */}
+            <div className="bg-slate-800 rounded-xl p-6 shadow-xl border border-slate-700">
+              <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+                <Users className="w-5 h-5 text-purple-400" />
+                Responder Details
+              </h2>
+
+              {/* Filters */}
+              <div className="space-y-3 mb-4">
+                {/* Search */}
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-slate-400" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search responders..."
+                    className="w-full pl-10 pr-4 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+
+                {/* Type Filter */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setFilterType('all')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      filterType === 'all' ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                    }`}
+                  >
+                    All
+                  </button>
+                  <button
+                    onClick={() => setFilterType('Fire')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      filterType === 'Fire' ? 'bg-orange-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                    }`}
+                  >
+                    Fire
+                  </button>
+                  <button
+                    onClick={() => setFilterType('Police')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      filterType === 'Police' ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                    }`}
+                  >
+                    Police
+                  </button>
+                </div>
+
+                {/* Status Filter */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setFilterStatus('all')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      filterStatus === 'all' ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                    }`}
+                  >
+                    All
+                  </button>
+                  <button
+                    onClick={() => setFilterStatus('active')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      filterStatus === 'active' ? 'bg-green-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                    }`}
+                  >
+                    Active
+                  </button>
+                  <button
+                    onClick={() => setFilterStatus('standby')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      filterStatus === 'standby' ? 'bg-yellow-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                    }`}
+                  >
+                    Standby
+                  </button>
+                </div>
+              </div>
+
+              {/* Responders List */}
+              <div className="space-y-3 max-h-[400px] overflow-y-auto">
+                {filteredResponders.length === 0 ? (
+                  <div className="text-center py-8 text-slate-400">
+                    <Users className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                    <p>No responders match your filters</p>
+                  </div>
+                ) : (
+                  filteredResponders.map(responder => (
+                    <div key={responder.id} className="bg-slate-700 rounded-lg p-4 hover:bg-slate-650 transition">
+                      <div className="flex items-center justify-between mb-2">
+                        <div>
+                          <div className="font-semibold text-white">{responder.name}</div>
+                          <div className="text-xs text-slate-400">{responder.id}</div>
+                        </div>
+                        <span className={`px-2 py-1 rounded text-xs font-semibold ${
+                          responder.type === 'Fire' ? 'bg-orange-600 text-white' : 'bg-blue-600 text-white'
+                        }`}>
+                          {responder.type}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-slate-300 flex items-center gap-1">
+                          <MapPin className="w-3 h-3" />
+                          {responder.location}
+                        </span>
+                        <StatusBadge status={responder.status} size="sm" />
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </ProtectedRoute>
+  );
+}=== File: src/app/page.tsx ===
+'use client';
+
+import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '../lib/AuthContext';
+import { Shield } from 'lucide-react';
+
+export default function Home() {
+  const router = useRouter();
+  const { user, loading } = useAuth();
+
+  useEffect(() => {
+    if (!loading) {
+      if (user) {
+        router.push('/dashboard');
+      } else {
+        router.push('/login');
+      }
+    }
+  }, [user, loading, router]);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 flex items-center justify-center">
+      <div className="text-center">
+        <Shield className="w-16 h-16 text-blue-500 mx-auto mb-4 animate-pulse" />
+        <h1 className="text-2xl font-bold text-white mb-2">Crisis Management System</h1>
+        <p className="text-slate-400">Redirecting...</p>
+      </div>
+    </div>
+  );
+}=== File: src/app/resource-requests/page.tsx ===
+'use client';
+
+import React, { useState, useMemo } from 'react';
+import { Package, Send, ArrowLeft } from 'lucide-react';
+import Link from 'next/link';
+import { getHospitalData } from '../../lib/hospitalDataStore';
+import { addResourceRequest } from '../../lib/resourceRequestStore';
+
+export default function ResourceRequestsPage() {
+  const hospitals = getHospitalData();
+
+  // Dynamically detect valid resource types from hospital data
+  const resourceOptions = useMemo(() => {
+    if (hospitals.length === 0) {
+      return ['Beds', 'ICU', 'Ventilators', 'Oxygen Cylinders', 'PPE Kits', 'Medical Staff'];
+    }
+
+    const disallowed = ['id', 'name', 'hospitalName', 'timestamp', 'lastUpdated', 'totalBeds'];
+    const keys = new Set<string>();
+
+    hospitals.forEach((hosp) => {
+      Object.keys(hosp).forEach((key) => {
+        if (!disallowed.includes(key)) {
+          keys.add(key);
+        }
+      });
+    });
+
+    // Format the field names properly
+    return Array.from(keys)
+      .map((k) =>
+        k
+          .replace(/^available/i, '') // remove "available" prefix
+          .replace(/([A-Z])/g, ' $1') // space out camelCase
+          .replace(/\s+/g, ' ')
+          .trim()
+          .replace(/^./, (s) => s.toUpperCase()) // capitalize
+      )
+      .filter((name) => !['Last Updated', 'Total Beds'].includes(name));
+  }, [hospitals]);
+
+  const [formData, setFormData] = useState({
+    hospitalName: '',
+    resourceType: '',
+    quantity: '',
+    priority: 'Normal',
+  });
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    const { name, value } = e.target;
+    setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+
+    addResourceRequest({
+      hospitalName: formData.hospitalName,
+      resourceType: formData.resourceType,
+      quantity: Number(formData.quantity),
+      priority: formData.priority,
+    });
+
+    alert(`✅ Resource request submitted successfully!`);
+
+    setFormData({
+      hospitalName: '',
+      resourceType: '',
+      quantity: '',
+      priority: 'Normal',
+    });
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-white p-8">
+      <div className="max-w-2xl mx-auto">
+        {/* Back Button */}
+        <Link 
+          href="/dashboard"
+          className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300 mb-6"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back to Dashboard
+        </Link>
+
+        <div className="bg-slate-800 border border-slate-700 rounded-2xl shadow-xl p-8">
+          {/* Header */}
+          <div className="flex items-center mb-6">
+            <Package className="w-7 h-7 text-emerald-400 mr-3" />
+            <h1 className="text-2xl font-bold text-emerald-400">
+              Request Additional Resources
+            </h1>
+          </div>
+
+          <p className="text-slate-400 mb-6">
+            Submit a new request for critical resources such as ventilators, oxygen, or staff.
+            Requests will be reviewed by coordinators for approval and allocation.
+          </p>
+
+          {/* Request Form */}
+          <form onSubmit={handleSubmit} className="space-y-5">
+            {/* Hospital Selector */}
+            <div>
+              <label htmlFor="hospitalName" className="block text-slate-300 mb-2 font-medium">
+                Hospital Name *
+              </label>
+              <select
+                id="hospitalName"
+                name="hospitalName"
+                value={formData.hospitalName}
+                onChange={handleChange}
+                required
+                className="w-full bg-slate-700 text-white rounded-lg px-3 py-2 border border-slate-600 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              >
+                <option value="">Select Hospital</option>
+                {hospitals.map((h) => (
+                  <option key={h.id || h.name} value={h.name || h.hospitalName}>
+                    {h.name || h.hospitalName}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Resource Type Dropdown */}
+            <div>
+              <label htmlFor="resourceType" className="block text-slate-300 mb-2 font-medium">
+                Resource Type *
+              </label>
+              <select
+                id="resourceType"
+                name="resourceType"
+                value={formData.resourceType}
+                onChange={handleChange}
+                required
+                className="w-full bg-slate-700 text-white rounded-lg px-3 py-2 border border-slate-600 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              >
+                <option value="">Select Resource Type</option>
+                {resourceOptions.length === 0 ? (
+                  <option disabled>No resources available</option>
+                ) : (
+                  resourceOptions.map((type) => (
+                    <option key={type} value={type}>
+                      {type}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+
+            {/* Quantity */}
+            <div>
+              <label htmlFor="quantity" className="block text-slate-300 mb-2 font-medium">
+                Quantity Needed *
+              </label>
+              <input
+                id="quantity"
+                type="number"
+                name="quantity"
+                value={formData.quantity}
+                onChange={handleChange}
+                placeholder="e.g., 5"
+                className="w-full bg-slate-700 text-white rounded-lg px-3 py-2 border border-slate-600 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                required
+                min="1"
+              />
+            </div>
+
+            {/* Priority */}
+            <div>
+              <label htmlFor="priority" className="block text-slate-300 mb-2 font-medium">
+                Priority Level *
+              </label>
+              <select
+                id="priority"
+                name="priority"
+                value={formData.priority}
+                onChange={handleChange}
+                className="w-full bg-slate-700 text-white rounded-lg px-3 py-2 border border-slate-600 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              >
+                <option value="Normal">Normal</option>
+                <option value="High">High</option>
+                <option value="Critical">Critical</option>
+              </select>
+            </div>
+
+            {/* Submit Button */}
+            <button
+              type="submit"
+              className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3 rounded-lg flex items-center justify-center gap-2 transition-all"
+            >
+              <Send className="w-5 h-5" /> Submit Request
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}=== File: src/app/resource-review/page.tsx ===
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { ArrowLeft, CheckCircle, XCircle, Clock } from 'lucide-react';
+import {
+  getResourceRequests,
+  approveResourceRequest,
+  denyResourceRequest,
+  onRequestDataChange,
+  type ResourceRequest,
+} from '../../lib/resourceRequestStore';
+
+export default function ResourceReviewPage() {
+  const [requests, setRequests] = useState<ResourceRequest[]>([]);
+
+  useEffect(() => {
+    setRequests(getResourceRequests());
+    const unsubscribe = onRequestDataChange((updated) => setRequests(updated));
+    return () => unsubscribe();
+  }, []);
+
+  const handleApprove = (id: string) => {
+    approveResourceRequest(id);
+    alert('✅ Resource request approved and added to hospital inventory!');
+  };
+
+  const handleDeny = (id: string) => {
+    denyResourceRequest(id);
+    alert('❌ Resource request denied.');
+  };
+
+  const getPriorityColor = (priority: string) => {
+    switch (priority.toLowerCase()) {
+      case 'critical':
+        return 'bg-red-600 text-white';
+      case 'high':
+        return 'bg-orange-600 text-white';
+      default:
+        return 'bg-blue-600 text-white';
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-white p-8">
+      <div className="max-w-4xl mx-auto">
+        {/* Back Button */}
+        <Link 
+          href="/dashboard"
+          className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300 mb-6"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back to Dashboard
+        </Link>
+
+        <div className="bg-slate-800 p-6 rounded-2xl shadow-xl border border-slate-700 space-y-5">
+          <div>
+            <h1 className="text-3xl font-bold mb-2 text-purple-400">Resource Requests Review</h1>
+            <p className="text-slate-400">
+              Review and approve or deny pending resource requests from hospitals.
+            </p>
+          </div>
+
+          {requests.length === 0 ? (
+            <div className="bg-slate-700 rounded-xl p-12 text-center border border-slate-600">
+              <Clock className="w-16 h-16 text-slate-500 mx-auto mb-4" />
+              <p className="text-slate-400 text-lg font-medium mb-2">No Pending Requests</p>
+              <p className="text-slate-500 text-sm">
+                All resource requests have been processed.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {requests.map((r) => (
+                <div
+                  key={r.id}
+                  className="bg-slate-700 border border-slate-600 p-5 rounded-xl hover:bg-slate-650 transition-all"
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-3 mb-3">
+                        <h3 className="text-xl font-semibold text-white">
+                          {r.hospitalName}
+                        </h3>
+                        <span className={`px-3 py-1 rounded-full text-xs font-bold ${getPriorityColor(r.priority)}`}>
+                          {r.priority.toUpperCase()}
+                        </span>
+                      </div>
+
+                      <div className="space-y-2 text-slate-300">
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-500">Resource:</span>
+                          <span className="font-semibold text-emerald-400">
+                            {r.resourceType}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-500">Quantity:</span>
+                          <span className="font-semibold text-white">
+                            {r.quantity}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-slate-500">Requested:</span>
+                          <span className="text-slate-400 text-sm">
+                            {new Date(r.timestamp).toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="flex flex-col gap-2">
+                      <button
+                        onClick={() => handleApprove(r.id)}
+                        className="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors"
+                      >
+                        <CheckCircle className="w-4 h-4" />
+                        Approve
+                      </button>
+                      <button
+                        onClick={() => handleDeny(r.id)}
+                        className="flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors"
+                      >
+                        <XCircle className="w-4 h-4" />
+                        Deny
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Summary */}
+          {requests.length > 0 && (
+            <div className="bg-slate-700 border border-slate-600 p-4 rounded-xl">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-slate-400">Total Pending Requests:</span>
+                <span className="text-white font-bold text-lg">{requests.length}</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}=== File: src/app/responder-management/page.tsx ===
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import ProtectedRoute from '../../components/ProtectedRoute';
+import Navigation from '../../components/Navigation';
+import Link from 'next/link';
+import { Users, MapPin, ArrowLeft, CheckCircle, Radio, AlertCircle } from 'lucide-react';
+import StatusBadge from '../../components/StatusBadge';
+
+interface Responder {
+  id: string;
+  name: string;
+  type: 'Fire' | 'Police';
+  status: 'active' | 'standby';
+  location: string;
+  coords?: { lat: number; lng: number };
+}
+
+export default function ResponderManagementPage() {
+  const [responders, setResponders] = useState<Responder[]>([
+    { id: 'FR-101', name: 'Unit Alpha', type: 'Fire', status: 'standby', location: 'Downtown', coords: { lat: 33.7490, lng: -84.3880 } },
+    { id: 'FR-102', name: 'Unit Bravo', type: 'Police', status: 'active', location: 'North District', coords: { lat: 33.8958, lng: -84.3014 } },
+    { id: 'FR-103', name: 'Unit Charlie', type: 'Fire', status: 'standby', location: 'Station 3', coords: { lat: 33.6407, lng: -84.4277 } },
+    { id: 'FR-104', name: 'Unit Delta', type: 'Police', status: 'active', location: 'Highway 5', coords: { lat: 33.7550, lng: -84.4000 } },
+  ]);
+
+  const [selectedResponder, setSelectedResponder] = useState<string | null>(null);
+  const [trackingLocation, setTrackingLocation] = useState<string | null>(null);
+
+  // Load responder data from localStorage on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const loadedResponders = responders.map(r => {
+        const status = localStorage.getItem(`responder_${r.id.toLowerCase()}_status`) as 'active' | 'standby';
+        const locationStr = localStorage.getItem(`responder_${r.id.toLowerCase()}_location`);
+        let coords = r.coords;
+        
+        if (locationStr) {
+          try {
+            coords = JSON.parse(locationStr);
+          } catch (e) {
+            console.error('Error parsing location:', e);
+          }
+        }
+        
+        return {
+          ...r,
+          status: status || r.status,
+          coords
+        };
+      });
+      setResponders(loadedResponders);
+    }
+  }, []);
+
+  // Update responder status
+  const updateStatus = (id: string, newStatus: 'active' | 'standby') => {
+    setResponders(prev => prev.map(r => 
+      r.id === id ? { ...r, status: newStatus } : r
+    ));
+    
+    // Save to localStorage
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(`responder_${id.toLowerCase()}_status`, newStatus);
+    }
+    
+    // Trigger storage event for other components
+    window.dispatchEvent(new Event('storage'));
+  };
+
+  // Start tracking location for a responder
+  const startLocationTracking = (id: string) => {
+    setTrackingLocation(id);
+    
+    if ('geolocation' in navigator) {
+      navigator.geolocation.watchPosition(
+        (position) => {
+          const newCoords = {
+            lat: position.coords.latitude,
+            lng: position.coords.longitude
+          };
+          
+          // Update responder location
+          setResponders(prev => prev.map(r => 
+            r.id === id ? { ...r, coords: newCoords, location: `${newCoords.lat.toFixed(4)}, ${newCoords.lng.toFixed(4)}` } : r
+          ));
+          
+          // Save to localStorage
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(`responder_${id.toLowerCase()}_location`, JSON.stringify(newCoords));
+          }
+          
+          // Trigger storage event
+          window.dispatchEvent(new Event('storage'));
+        },
+        (error) => {
+          console.error('Geolocation error:', error);
+          alert('Unable to track location. Please enable location services.');
+          setTrackingLocation(null);
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 5000,
+          maximumAge: 0
+        }
+      );
+    } else {
+      alert('Geolocation is not supported by your browser');
+    }
+  };
+
+  // Stop tracking location
+  const stopLocationTracking = () => {
+    setTrackingLocation(null);
+  };
+
+  const activeCount = responders.filter(r => r.status === 'active').length;
+  const standbyCount = responders.filter(r => r.status === 'standby').length;
+
+  return (
+    <ProtectedRoute requiredPermissions={['canManageResponders']}>
+      <div className="min-h-screen bg-slate-900">
+        <Navigation />
+
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          {/* Back Button */}
+          <Link 
+            href="/dashboard"
+            className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300 mb-6"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            Back to Dashboard
+          </Link>
+
+          {/* Header */}
+          <div className="mb-8">
+            <h1 className="text-3xl font-bold text-white mb-2 flex items-center gap-3">
+              <Users className="w-8 h-8 text-purple-500" />
+              Responder Management
+            </h1>
+            <p className="text-slate-400">Manage first responder status and locations</p>
+          </div>
+
+          {/* Stats */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 mb-8">
+            <div className="bg-slate-800 rounded-xl p-6 shadow-lg border border-slate-700">
+              <div className="flex items-center justify-between mb-2">
+                <Users className="w-6 h-6 text-blue-400" />
+                <span className="text-2xl font-bold text-white">{responders.length}</span>
+              </div>
+              <p className="text-slate-400 text-sm">Total Units</p>
+            </div>
+
+            <div className="bg-slate-800 rounded-xl p-6 shadow-lg border border-slate-700">
+              <div className="flex items-center justify-between mb-2">
+                <Radio className="w-6 h-6 text-green-400" />
+                <span className="text-2xl font-bold text-white">{activeCount}</span>
+              </div>
+              <p className="text-slate-400 text-sm">Active Units</p>
+            </div>
+
+            <div className="bg-slate-800 rounded-xl p-6 shadow-lg border border-slate-700">
+              <div className="flex items-center justify-between mb-2">
+                <AlertCircle className="w-6 h-6 text-yellow-400" />
+                <span className="text-2xl font-bold text-white">{standbyCount}</span>
+              </div>
+              <p className="text-slate-400 text-sm">Standby Units</p>
+            </div>
+          </div>
+
+          {/* Quick Actions */}
+          <div className="bg-blue-900/30 border border-blue-600/50 rounded-lg p-4 mb-6">
+            <div className="flex items-start gap-3">
+              <MapPin className="w-5 h-5 text-blue-400 mt-0.5" />
+              <div>
+                <h3 className="text-white font-semibold mb-1">Location Tracking</h3>
+                <p className="text-blue-200 text-sm">
+                  Click "Track Location" on any responder to enable real-time GPS tracking. 
+                  Make sure to allow location access in your browser.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Responders Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {responders.map(responder => (
+              <div
+                key={responder.id}
+                className={`bg-slate-800 rounded-xl p-6 shadow-xl border transition-all ${
+                  selectedResponder === responder.id
+                    ? 'border-blue-500 ring-2 ring-blue-500/50'
+                    : 'border-slate-700 hover:border-slate-600'
+                }`}
+                onClick={() => setSelectedResponder(responder.id)}
+              >
+                {/* Header */}
+                <div className="flex items-center justify-between mb-4">
+                  <div>
+                    <h3 className="text-lg font-bold text-white">{responder.name}</h3>
+                    <p className="text-sm text-slate-400">{responder.id}</p>
+                  </div>
+                  <span className={`px-3 py-1 rounded-lg text-xs font-semibold ${
+                    responder.type === 'Fire' ? 'bg-orange-600 text-white' : 'bg-blue-600 text-white'
+                  }`}>
+                    {responder.type}
+                  </span>
+                </div>
+
+                {/* Status */}
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-slate-300 mb-2">
+                    Current Status
+                  </label>
+                  <div className="flex items-center justify-between">
+                    <StatusBadge status={responder.status} size="md" />
+                  </div>
+                </div>
+
+                {/* Location */}
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-slate-300 mb-2">
+                    Location
+                  </label>
+                  <div className="flex items-start gap-2 text-sm text-slate-400">
+                    <MapPin className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    <span>{responder.location}</span>
+                  </div>
+                  {responder.coords && (
+                    <div className="text-xs text-slate-500 mt-1 ml-6">
+                      {responder.coords.lat.toFixed(6)}, {responder.coords.lng.toFixed(6)}
+                    </div>
+                  )}
+                </div>
+
+                {/* Action Buttons */}
+                <div className="space-y-2">
+                  {/* Status Toggle */}
+                  <div className="flex gap-2">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        updateStatus(responder.id, 'active');
+                      }}
+                      className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                        responder.status === 'active'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                      }`}
+                    >
+                      Active
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        updateStatus(responder.id, 'standby');
+                      }}
+                      className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                        responder.status === 'standby'
+                          ? 'bg-yellow-600 text-white'
+                          : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                      }`}
+                    >
+                      Standby
+                    </button>
+                  </div>
+
+                  {/* Location Tracking */}
+                  {trackingLocation === responder.id ? (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        stopLocationTracking();
+                      }}
+                      className="w-full bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                    >
+                      <Radio className="w-4 h-4 animate-pulse" />
+                      Stop Tracking
+                    </button>
+                  ) : (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        startLocationTracking(responder.id);
+                      }}
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                    >
+                      <MapPin className="w-4 h-4" />
+                      Track Location
+                    </button>
+                  )}
+                </div>
+
+                {/* Tracking Indicator */}
+                {trackingLocation === responder.id && (
+                  <div className="mt-3 bg-green-900/30 border border-green-600/50 rounded-lg p-2 flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 text-green-400" />
+                    <span className="text-xs text-green-300">Location tracking active</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* View on Map Link */}
+          <div className="mt-8 text-center">
+            <Link
+              href="/map"
+              className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors"
+            >
+              <MapPin className="w-5 h-5" />
+              View All on Map
+            </Link>
+          </div>
+        </div>
+      </div>
+    </ProtectedRoute>
+  );
+}=== File: src/components/AlertSystem.tsx ===
+"use client";
+
+import React, { useState, useEffect } from 'react';
+import { AlertTriangle, Bell, X, Send } from 'lucide-react';
+
+// Mock Alert API
+const mockAlertAPI = {
+  alerts: [],
+  
+  submitAlert: function(alert) {
+    const newAlert = {
+      id: Date.now(),
+      timestamp: new Date().toISOString(),
+      ...alert
+    };
+    this.alerts.push(newAlert);
+    return Promise.resolve(newAlert);
+  },
+  
+  getAlerts: function() {
+    return Promise.resolve([...this.alerts]);
+  },
+  
+  dismissAlert: function(alertId) {
+    this.alerts = this.alerts.filter(a => a.id !== alertId);
+    return Promise.resolve();
+  }
+};
+
+interface Alert {
+  id: number;
+  timestamp: string;
+  message: string;
+  priority: 'normal' | 'urgent';
+  agency: string;
+}
+
+export default function AlertSystem() {
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [showSubmissionForm, setShowSubmissionForm] = useState(false);
+  const [formData, setFormData] = useState({
+    message: '',
+    priority: 'normal' as 'normal' | 'urgent',
+    agency: ''
+  });
+  const [dismissedAlerts, setDismissedAlerts] = useState(new Set<number>());
+
+  // Fetch alerts periodically
+  useEffect(() => {
+    const fetchAlerts = async () => {
+      const fetchedAlerts = await mockAlertAPI.getAlerts();
+      setAlerts(fetchedAlerts);
+    };
+
+    fetchAlerts();
+    const interval = setInterval(fetchAlerts, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleSubmit = async () => {
+    if (!formData.message.trim() || !formData.agency.trim()) {
+      alert('Please fill in all required fields');
+      return;
+    }
+
+    await mockAlertAPI.submitAlert(formData);
+    
+    setFormData({ message: '', priority: 'normal', agency: '' });
+    setShowSubmissionForm(false);
+    
+    const fetchedAlerts = await mockAlertAPI.getAlerts();
+    setAlerts(fetchedAlerts);
+  };
+
+  const handleDismiss = (alertId: number) => {
+    setDismissedAlerts(prev => new Set([...prev, alertId]));
+  };
+
+  const visibleAlerts = alerts.filter(alert => !dismissedAlerts.has(alert.id));
+  const urgentAlerts = visibleAlerts.filter(a => a.priority === 'urgent');
+  const normalAlerts = visibleAlerts.filter(a => a.priority === 'normal');
+
+  return (
+    <div className="space-y-4">
+      {/* Header */}
+      <div className="bg-slate-800 rounded-lg shadow-xl border border-slate-700 p-5">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-xl font-bold text-white">Government Alerts</h2>
+            <p className="text-slate-400 text-sm">Inter-agency communications</p>
+          </div>
+          <button
+            onClick={() => setShowSubmissionForm(!showSubmissionForm)}
+            className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition flex items-center gap-2"
+          >
+            <Send className="w-4 h-4" />
+            Submit Alert
+          </button>
+        </div>
+      </div>
+
+      {/* Alert Submission Form */}
+      {showSubmissionForm && (
+        <div className="bg-slate-800 rounded-lg shadow-lg p-5 border-2 border-blue-500">
+          <h3 className="text-lg font-semibold mb-4 text-white">Submit Agency Alert</h3>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">
+                Agency Name *
+              </label>
+              <input
+                type="text"
+                value={formData.agency}
+                onChange={(e) => setFormData({ ...formData, agency: e.target.value })}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder="e.g., Department of Homeland Security"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">
+                Alert Message *
+              </label>
+              <textarea
+                value={formData.message}
+                onChange={(e) => setFormData({ ...formData, message: e.target.value })}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                rows={3}
+                placeholder="Enter your alert message here..."
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">
+                Priority Level *
+              </label>
+              <select
+                value={formData.priority}
+                onChange={(e) => setFormData({ ...formData, priority: e.target.value as 'normal' | 'urgent' })}
+                className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+                <option value="normal">Normal</option>
+                <option value="urgent">Urgent</option>
+              </select>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={handleSubmit}
+                className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition"
+              >
+                Submit Alert
+              </button>
+              <button
+                onClick={() => setShowSubmissionForm(false)}
+                className="bg-slate-600 text-white px-6 py-2 rounded-lg hover:bg-slate-500 transition"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Urgent Alerts */}
+      {urgentAlerts.length > 0 && (
+        <div className="space-y-3">
+          {urgentAlerts.map((alert) => (
+            <div
+              key={alert.id}
+              className="bg-red-900/30 border-l-4 border-red-600 rounded-lg shadow-lg p-4 animate-pulse"
+            >
+              <div className="flex items-start justify-between">
+                <div className="flex items-start gap-3 flex-1">
+                  <div className="text-red-400 mt-1">
+                    <AlertTriangle className="w-5 h-5" />
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className="bg-red-600 text-white text-xs font-bold px-2 py-1 rounded">
+                        URGENT
+                      </span>
+                      <span className="text-sm font-semibold text-slate-300">
+                        {alert.agency}
+                      </span>
+                    </div>
+                    <p className="text-red-100 font-medium mb-1">{alert.message}</p>
+                    <p className="text-red-300 text-xs">
+                      {new Date(alert.timestamp).toLocaleString()}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => handleDismiss(alert.id)}
+                  className="text-red-400 hover:text-red-300 ml-4"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Normal Alerts */}
+      {normalAlerts.length > 0 && (
+        <div className="space-y-2">
+          {normalAlerts.map((alert) => (
+            <div
+              key={alert.id}
+              className="bg-blue-900/30 border-l-4 border-blue-500 rounded-lg shadow p-3"
+            >
+              <div className="flex items-start justify-between">
+                <div className="flex items-start gap-3 flex-1">
+                  <div className="text-blue-400 mt-1">
+                    <Bell className="w-4 h-4" />
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="bg-blue-600 text-white text-xs font-bold px-2 py-1 rounded">
+                        INFO
+                      </span>
+                      <span className="text-xs font-semibold text-slate-300">
+                        {alert.agency}
+                      </span>
+                    </div>
+                    <p className="text-blue-100 text-sm font-medium">{alert.message}</p>
+                    <p className="text-blue-300 text-xs mt-1">
+                      {new Date(alert.timestamp).toLocaleString()}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => handleDismiss(alert.id)}
+                  className="text-blue-400 hover:text-blue-300 ml-4"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* No Alerts Message */}
+      {visibleAlerts.length === 0 && (
+        <div className="bg-slate-800 rounded-lg shadow-xl border border-slate-700 p-8 text-center">
+          <Bell className="w-10 h-10 text-slate-500 mx-auto mb-3" />
+          <h3 className="text-lg font-medium text-white mb-2">No Active Alerts</h3>
+          <p className="text-slate-400">All services are operating normally</p>
+        </div>
+      )}
+
+      {/* Alert Statistics */}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="text-center p-4 bg-slate-800 rounded-lg border border-slate-700">
+          <p className="text-2xl font-bold text-white">{alerts.length}</p>
+          <p className="text-sm text-slate-400">Total</p>
+        </div>
+        <div className="text-center p-4 bg-slate-800 rounded-lg border border-slate-700">
+          <p className="text-2xl font-bold text-red-400">{urgentAlerts.length}</p>
+          <p className="text-sm text-slate-400">Urgent</p>
+        </div>
+        <div className="text-center p-4 bg-slate-800 rounded-lg border border-slate-700">
+          <p className="text-2xl font-bold text-blue-400">{normalAlerts.length}</p>
+          <p className="text-sm text-slate-400">Normal</p>
+        </div>
+      </div>
+    </div>
+  );
+}=== File: src/components/AmbulanceCard.tsx ===
+import React from 'react';
+import { Ambulance } from 'lucide-react';
+import StatusBadge from './StatusBadge';
+import { AmbulanceType } from '../lib/types';
+
+interface AmbulanceCardProps {
+  ambulances: AmbulanceType[];
+}
+
+export default function AmbulanceCard({ ambulances }: AmbulanceCardProps) {
+  return (
+    <div className="bg-slate-800 rounded-lg p-5 shadow-xl border border-slate-700">
+      <div className="flex items-center mb-4">
+        <Ambulance className="w-6 h-6 mr-2 text-blue-400" />
+        <h2 className="text-xl font-semibold">Ambulances</h2>
+        <span className="ml-auto bg-blue-600 px-3 py-1 rounded-full text-sm">
+          {ambulances.length}
+        </span>
+      </div>
+      <div className="space-y-3">
+        {ambulances.map(amb => (
+          <div key={amb.id} className="bg-slate-700 rounded p-3 hover:bg-slate-650 transition">
+            <div className="flex items-center justify-between mb-2">
+              <span className="font-semibold">{amb.id}</span>
+              <StatusBadge status={amb.status} />
+            </div>
+            <div className="text-sm text-slate-300">
+              <div>📍 {amb.location}</div>
+              <div className="text-slate-500 text-xs mt-1">
+                Updated: {amb.lastUpdate}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}=== File: src/components/Communications.tsx ===
+=== File: src/components/DashboardHeader.tsx ===
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { Bell } from 'lucide-react';
+import Link from 'next/link';
+
+export default function DashboardHeader({ alertCount = 0 }: { alertCount?: number }) {
+  const [currentTime, setCurrentTime] = useState(new Date());
+
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="mb-6 flex justify-between items-center">
+      <div>
+        <h1 className="text-3xl font-bold mb-1">Crisis Management Dashboard</h1>
+        <p className="text-slate-400">Real-time coordination and monitoring</p>
+      </div>
+      <div className="flex items-center gap-4">
+        {/* Alert Bell */}
+        <Link href="/alerts" className="relative">
+          <Bell className="w-6 h-6 text-slate-400 hover:text-white transition" />
+          {alertCount > 0 && (
+            <span className="absolute -top-2 -right-2 bg-red-600 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+              {alertCount}
+            </span>
+          )}
+        </Link>
+
+        {/* Clock */}
+        <div className="text-right">
+          <div className="text-2xl font-mono">{currentTime.toLocaleTimeString()}</div>
+          <div className="text-slate-400">{currentTime.toLocaleDateString()}</div>
+        </div>
+      </div>
+    </div>
+  );
+}=== File: src/components/FirstResponderCard.tsx ===
+=== File: src/components/HospitalCard.tsx ===
+=== File: src/components/HospitalResourceForm.tsx ===
+'use client';
+
+import React, { useState } from 'react';
+import { saveHospitalData, getHospitalData, HospitalData } from '../lib/hospitalDataStore';
+
+export default function HospitalResourceForm() {
+  const [formData, setFormData] = useState({
+    hospitalName: '',
+    totalBeds: '',
+    availableBeds: '',
+    availableICU: '',
+    ventilators: '',
+  });
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+
+    const hospitals = getHospitalData();
+    const existingIndex = hospitals.findIndex(
+      (h) => h.name.toLowerCase() === formData.hospitalName.trim().toLowerCase()
+    );
+
+    const newHospital: HospitalData = {
+      name: formData.hospitalName.trim(),
+      totalBeds: Number(formData.totalBeds),
+      availableBeds: Number(formData.availableBeds),
+      availableICU: Number(formData.availableICU),
+      ventilators: Number(formData.ventilators),
+      lastUpdated: new Date().toISOString(),
+    };
+
+    if (existingIndex !== -1) {
+      // Update existing hospital
+      hospitals[existingIndex] = {
+        ...hospitals[existingIndex],
+        ...newHospital,
+      };
+    } else {
+      // Add new hospital with generated ID
+      const newId = `HSP-${String(hospitals.length + 1).padStart(3, '0')}`;
+      hospitals.push({
+        ...newHospital,
+        id: newId,
+      });
+    }
+
+    saveHospitalData(hospitals);
+
+    // Clear form
+    setFormData({
+      hospitalName: '',
+      totalBeds: '',
+      availableBeds: '',
+      availableICU: '',
+      ventilators: '',
+    });
+
+    // Show success message
+    alert(`✅ Hospital data saved successfully!`);
+  };
+
+  return (
+    <div className="bg-slate-800 p-6 rounded-2xl shadow-xl border border-slate-700">
+      <h2 className="text-xl font-semibold text-white mb-4">Add or Update Hospital</h2>
+
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <label htmlFor="hospitalName" className="block text-sm text-slate-300 mb-1">
+            Hospital Name *
+          </label>
+          <input
+            id="hospitalName"
+            type="text"
+            name="hospitalName"
+            placeholder="e.g., Central Medical Center"
+            value={formData.hospitalName}
+            onChange={handleChange}
+            className="w-full px-3 py-2 rounded-lg bg-slate-700 text-white border border-slate-600 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+            required
+          />
+        </div>
+
+        <div>
+          <label htmlFor="totalBeds" className="block text-sm text-slate-300 mb-1">
+            Total Beds *
+          </label>
+          <input
+            id="totalBeds"
+            type="number"
+            name="totalBeds"
+            placeholder="e.g., 100"
+            value={formData.totalBeds}
+            onChange={handleChange}
+            className="w-full px-3 py-2 rounded-lg bg-slate-700 text-white border border-slate-600 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+            required
+            min="0"
+          />
+        </div>
+
+        <div>
+          <label htmlFor="availableBeds" className="block text-sm text-slate-300 mb-1">
+            Available Beds *
+          </label>
+          <input
+            id="availableBeds"
+            type="number"
+            name="availableBeds"
+            placeholder="e.g., 25"
+            value={formData.availableBeds}
+            onChange={handleChange}
+            className="w-full px-3 py-2 rounded-lg bg-slate-700 text-white border border-slate-600 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+            required
+            min="0"
+          />
+        </div>
+
+        <div>
+          <label htmlFor="availableICU" className="block text-sm text-slate-300 mb-1">
+            ICU Beds Available *
+          </label>
+          <input
+            id="availableICU"
+            type="number"
+            name="availableICU"
+            placeholder="e.g., 10"
+            value={formData.availableICU}
+            onChange={handleChange}
+            className="w-full px-3 py-2 rounded-lg bg-slate-700 text-white border border-slate-600 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+            required
+            min="0"
+          />
+        </div>
+
+        <div>
+          <label htmlFor="ventilators" className="block text-sm text-slate-300 mb-1">
+            Ventilators Available *
+          </label>
+          <input
+            id="ventilators"
+            type="number"
+            name="ventilators"
+            placeholder="e.g., 15"
+            value={formData.ventilators}
+            onChange={handleChange}
+            className="w-full px-3 py-2 rounded-lg bg-slate-700 text-white border border-slate-600 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+            required
+            min="0"
+          />
+        </div>
+
+        <button
+          type="submit"
+          className="w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded-lg font-semibold text-white transition-colors"
+        >
+          Save Hospital Data
+        </button>
+      </form>
+    </div>
+  );
+}=== File: src/components/HospitalResourcePanel.tsx ===
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import { Building2, Bed, Activity, HeartPulse, Clock4 } from 'lucide-react';
+import { getHospitalData, onHospitalDataChange, HospitalData } from '../lib/hospitalDataStore';
+
+interface HospitalResourcePanelProps {
+  data?: HospitalData[];
+  compact?: boolean;
+}
+
+export default function HospitalResourcePanel({ data, compact = false }: HospitalResourcePanelProps) {
+  const [hospitals, setHospitals] = useState<HospitalData[]>(data || getHospitalData());
+
+  useEffect(() => {
+    // If data prop is provided, use it (controlled component)
+    if (data) {
+      setHospitals(data);
+      return;
+    }
+
+    // Otherwise, load from store (uncontrolled component)
+    setHospitals(getHospitalData());
+
+    // Subscribe to future updates
+    const unsubscribe = onHospitalDataChange((updatedData) => {
+      if (!data) {
+        setHospitals(updatedData);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [data]);
+
+  return (
+    <div className={`bg-slate-800 rounded-2xl p-6 shadow-xl border border-slate-700 ${compact ? 'p-4' : ''}`}>
+      <div className="flex items-center mb-6">
+        <Building2 className={`${compact ? 'w-5 h-5' : 'w-6 h-6'} text-emerald-400 mr-2`} />
+        <h2 className={`${compact ? 'text-lg' : 'text-xl'} font-semibold text-white`}>
+          Hospital Resource Overview
+        </h2>
+        <span className="ml-auto bg-emerald-600 px-3 py-1 rounded-full text-sm">
+          {hospitals.length}
+        </span>
+      </div>
+
+      {hospitals.length === 0 ? (
+        <p className="text-slate-400 text-sm italic text-center">
+          No hospital resource data available yet.
+        </p>
+      ) : (
+        <div className={`grid gap-4 ${compact ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3'}`}>
+          {hospitals.map((hospital) => (
+            <div
+              key={hospital.id || hospital.name}
+              className="bg-slate-700 rounded-xl p-4 border border-slate-600 hover:bg-slate-650 transition-all"
+            >
+              <div className="flex items-center justify-between mb-3">
+                <h3 className={`${compact ? 'text-base' : 'text-lg'} font-semibold text-white`}>
+                  {hospital.name}
+                </h3>
+                <span className="text-xs text-slate-400">
+                  {new Date(hospital.lastUpdated).toLocaleTimeString()}
+                </span>
+              </div>
+
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <div className="flex items-center gap-2 text-slate-400">
+                    <Bed className="w-4 h-4 text-emerald-400" />
+                    <span>Beds</span>
+                  </div>
+                  <span className="font-bold text-white">
+                    {hospital.availableBeds} / {hospital.totalBeds}
+                  </span>
+                </div>
+
+                <div className="flex justify-between">
+                  <div className="flex items-center gap-2 text-slate-400">
+                    <Activity className="w-4 h-4 text-blue-400" />
+                    <span>ICU Beds</span>
+                  </div>
+                  <span className="font-bold text-white">{hospital.availableICU}</span>
+                </div>
+
+                <div className="flex justify-between">
+                  <div className="flex items-center gap-2 text-slate-400">
+                    <HeartPulse className="w-4 h-4 text-pink-400" />
+                    <span>Ventilators</span>
+                  </div>
+                  <span className="font-bold text-white">{hospital.ventilators}</span>
+                </div>
+
+                {!compact && (
+                  <div className="flex justify-between">
+                    <div className="flex items-center gap-2 text-slate-400">
+                      <Clock4 className="w-4 h-4 text-yellow-400" />
+                      <span>Last Updated</span>
+                    </div>
+                    <span className="text-xs text-slate-400">
+                      {new Date(hospital.lastUpdated).toLocaleDateString()}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 bg-slate-600 h-2 rounded-full overflow-hidden">
+                <div
+                  className="h-2 bg-emerald-500 transition-all"
+                  style={{
+                    width: `${Math.min(
+                      (hospital.availableBeds / (hospital.totalBeds || 1)) * 100,
+                      100
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}=== File: src/components/LiveClock.tsx ===
+'use client';
+
+import { useState, useEffect } from 'react';
+
+export default function LiveClock() {
+  const [time, setTime] = useState(new Date());
+
+  useEffect(() => {
+    const interval = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="text-right">
+      <div className="text-2xl font-mono">{time.toLocaleTimeString()}</div>
+      <div className="text-slate-400">{time.toLocaleDateString()}</div>
+    </div>
+  );
+}=== File: src/components/Navigation.tsx ===
+// components/Navigation.tsx
+'use client';
+
+import { useAuth } from '../lib/AuthContext';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import {
+  LayoutDashboard,
+  Map,
+  Building2,
+  Users,
+  Bell,
+  FileText,
+  Settings,
+  LogOut,
+  Menu,
+  X,
+  Shield,
+  User,
+} from 'lucide-react';
+import { useState } from 'react';
+
+export default function Navigation() {
+  const { user, logout, hasPermission } = useAuth();
+  const pathname = usePathname();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  if (!user) {
+    return null;
+  }
+
+  const navigation = [
+    {
+      name: 'Dashboard',
+      href: '/dashboard',
+      icon: LayoutDashboard,
+      show: hasPermission('canAccessDashboard'),
+    },
+    {
+      name: 'Map View',
+      href: '/map',
+      icon: Map,
+      show: hasPermission('canViewMap'),
+    },
+    {
+      name: 'Hospital Resources',
+      href: '/hospital-resources',
+      icon: Building2,
+      show: hasPermission('canManageHospitals'),
+    },
+    {
+      name: 'Resource Requests',
+      href: '/resource-requests',
+      icon: FileText,
+      show: hasPermission('canManageHospitals'),
+    },
+    {
+      name: 'Review Requests',
+      href: '/resource-review',
+      icon: Shield,
+      show: hasPermission('canReviewRequests'),
+    },
+    {
+      name: 'Responders',
+      href: '/responder-management',
+      icon: Users,
+      show: hasPermission('canManageResponders'),
+    },
+    {
+      name: 'Alerts',
+      href: '/alerts',
+      icon: Bell,
+      show: hasPermission('canSendAlerts'),
+    },
+  ].filter((item) => item.show);
+
+  const getRoleBadgeColor = (role: string) => {
+    switch (role) {
+      case 'admin':
+        return 'bg-red-600';
+      case 'dispatcher':
+        return 'bg-yellow-600';
+      case 'hospital_worker':
+        return 'bg-emerald-600';
+      case 'first_responder':
+        return 'bg-purple-600';
+      default:
+        return 'bg-blue-600';
+    }
+  };
+
+  const getRoleLabel = (role: string) => {
+    switch (role) {
+      case 'admin':
+        return 'Administrator';
+      case 'dispatcher':
+        return 'Dispatcher';
+      case 'hospital_worker':
+        return 'Hospital Worker';
+      case 'first_responder':
+        return 'First Responder';
+      default:
+        return 'User';
+    }
+  };
+
+  return (
+    <>
+      {/* Top Navigation Bar */}
+      <nav className="bg-slate-800 border-b border-slate-700 sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-16">
+            {/* Logo and Title */}
+            <div className="flex items-center">
+              <Shield className="w-8 h-8 text-blue-500 mr-3" />
+              <div>
+                <h1 className="text-xl font-bold text-white">Crisis Management</h1>
+                <p className="text-xs text-slate-400 hidden sm:block">Real-time Coordination</p>
+              </div>
+            </div>
+
+            {/* Desktop Navigation */}
+            <div className="hidden md:flex items-center space-x-4">
+              {navigation.map((item) => {
+                const Icon = item.icon;
+                const isActive = pathname === item.href;
+                return (
+                  <Link
+                    key={item.name}
+                    href={item.href}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
+                      isActive
+                        ? 'bg-blue-600 text-white'
+                        : 'text-slate-300 hover:bg-slate-700 hover:text-white'
+                    }`}
+                  >
+                    <Icon className="w-4 h-4" />
+                    <span className="text-sm font-medium">{item.name}</span>
+                  </Link>
+                );
+              })}
+            </div>
+
+            {/* User Menu */}
+            <div className="flex items-center gap-3">
+              {/* User Info */}
+              <div className="hidden sm:block text-right">
+                <p className="text-sm font-medium text-white">{user.name}</p>
+                <div className="flex items-center justify-end gap-2">
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded-full text-white ${getRoleBadgeColor(
+                      user.role
+                    )}`}
+                  >
+                    {getRoleLabel(user.role)}
+                  </span>
+                </div>
+              </div>
+
+              {/* Logout Button */}
+              <button
+                onClick={logout}
+                className="flex items-center gap-2 px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors text-sm font-medium"
+              >
+                <LogOut className="w-4 h-4" />
+                <span className="hidden sm:inline">Logout</span>
+              </button>
+
+              {/* Mobile Menu Button */}
+              <button
+                onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+                className="md:hidden p-2 rounded-lg text-slate-300 hover:bg-slate-700"
+              >
+                {mobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Mobile Navigation */}
+        {mobileMenuOpen && (
+          <div className="md:hidden border-t border-slate-700 bg-slate-800">
+            <div className="px-4 py-3 space-y-2">
+              {/* User Info on Mobile */}
+              <div className="pb-3 mb-3 border-b border-slate-700">
+                <div className="flex items-center gap-3">
+                  <div className="bg-slate-700 p-2 rounded-full">
+                    <User className="w-5 h-5 text-slate-300" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium text-white">{user.name}</p>
+                    <span
+                      className={`text-xs px-2 py-0.5 rounded-full text-white ${getRoleBadgeColor(
+                        user.role
+                      )}`}
+                    >
+                      {getRoleLabel(user.role)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Mobile Nav Links */}
+              {navigation.map((item) => {
+                const Icon = item.icon;
+                const isActive = pathname === item.href;
+                return (
+                  <Link
+                    key={item.name}
+                    href={item.href}
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
+                      isActive
+                        ? 'bg-blue-600 text-white'
+                        : 'text-slate-300 hover:bg-slate-700 hover:text-white'
+                    }`}
+                  >
+                    <Icon className="w-5 h-5" />
+                    <span className="font-medium">{item.name}</span>
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </nav>
+    </>
+  );
+}=== File: src/components/ProtectedRoute.tsx ===
+// components/ProtectedRoute.tsx
+'use client';
+
+import { useAuth } from '../lib/AuthContext';
+import { useRouter } from 'next/navigation';
+import { useEffect } from 'react';
+import { Shield } from 'lucide-react';
+
+interface ProtectedRouteProps {
+  children: React.ReactNode;
+  requiredPermissions?: string[];
+  fallbackPath?: string;
+}
+
+export default function ProtectedRoute({
+  children,
+  requiredPermissions = [],
+  fallbackPath = '/login',
+}: ProtectedRouteProps) {
+  const { user, loading, hasPermission } = useAuth();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (!loading) {
+      if (!user) {
+        router.push(fallbackPath);
+        return;
+      }
+
+      // Check required permissions
+      if (requiredPermissions.length > 0) {
+        const hasAllPermissions = requiredPermissions.every((permission) =>
+          hasPermission(permission)
+        );
+
+        if (!hasAllPermissions) {
+          router.push('/unauthorized');
+        }
+      }
+    }
+  }, [user, loading, router, requiredPermissions, fallbackPath, hasPermission]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mb-4"></div>
+          <p className="text-white">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return null;
+  }
+
+  // Check permissions
+  if (requiredPermissions.length > 0) {
+    const hasAllPermissions = requiredPermissions.every((permission) =>
+      hasPermission(permission)
+    );
+
+    if (!hasAllPermissions) {
+      return (
+        <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6">
+          <div className="bg-slate-800 rounded-lg p-8 shadow-xl border border-slate-700 max-w-md w-full text-center">
+            <Shield className="w-16 h-16 text-red-500 mx-auto mb-4" />
+            <h1 className="text-2xl font-bold text-white mb-2">Access Denied</h1>
+            <p className="text-slate-400 mb-6">
+              You don't have permission to access this page.
+            </p>
+            <button
+              onClick={() => router.push('/dashboard')}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg transition-colors"
+            >
+              Go to Dashboard
+            </button>
+          </div>
+        </div>
+      );
+    }
+  }
+
+  return <>{children}</>;
+}=== File: src/components/ResourceChart.tsx ===
+'use client';
+
+import React from 'react';
+import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from 'recharts';
+import { ResourceChartData } from '../lib/types';
+
+interface ResourceChartProps {
+  data: Array<{ name: string; value: number; status: string }>;
+}
+
+export default function ResourceChart({ data }: ResourceChartProps) {
+  const COLORS: Record<string, string> = {
+    available: '#10b981',
+    'en-route': '#f59e0b',
+    'on-scene': '#ef4444',
+    standby: '#6366f1',
+    active: '#f59e0b'
+  };
+
+  // Helper function with type safety
+  const getColor = (status: string): string => {
+    return COLORS[status] || '#6b7280'; // Fallback to gray
+  };
+
+  return (
+    <div className="bg-slate-800 rounded-lg p-5 shadow-xl border border-slate-700">
+      <h3 className="text-lg font-semibold mb-4">Resource Distribution</h3>
+      <ResponsiveContainer width="100%" height={300}>
+        <PieChart>
+          <Pie
+            data={data}
+            cx="50%"
+            cy="50%"
+            labelLine={false}
+            label={(entry) => `${entry.name}: ${entry.value}`}
+            outerRadius={80}
+            fill="#8884d8"
+            dataKey="value"
+          >
+            {data.map((entry, index) => (
+              <Cell key={`cell-${index}`} fill={getColor(entry.status)} />
+            ))}
+          </Pie>
+          <Tooltip />
+          <Legend />
+        </PieChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}=== File: src/components/ResponderMap.tsx ===
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+
+interface GeoLocation {
+  lat: number;
+  lng: number;
+}
+
+interface Responder {
+  id: string;
+  name: string;
+  type: string;
+  status: string;
+  location: string;
+  coords?: GeoLocation;
+}
+
+interface Incident {
+  lat: number;
+  lng: number;
+  title: string;
+  status: string;
+  assigned: string[];
+}
+
+interface ResponderMapProps {
+  responders: Responder[];
+  incident?: Incident;
+}
+
+export default function ResponderMap({ responders, incident }: ResponderMapProps) {
+  const mapRef = useRef<L.Map | null>(null);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const markersRef = useRef<L.Marker[]>([]);
+  const [isClient, setIsClient] = useState(false);
+  const [positions, setPositions] = useState<Record<string, GeoLocation>>({});
+
+  // Ensure client-side only
+  useEffect(() => {
+    setIsClient(true);
+  }, []);
+
+  // Load responder positions
+  useEffect(() => {
+    if (!isClient) return;
+
+    const loadedPositions: Record<string, GeoLocation> = {};
+    responders.forEach((r: Responder) => {
+      const savedLoc = localStorage.getItem(`responder_${r.id.toLowerCase()}_location`);
+      let pos: GeoLocation | null = null;
+      
+      if (savedLoc) {
+        try {
+          pos = JSON.parse(savedLoc);
+        } catch (e) {
+          console.error('Invalid location data for', r.id, e);
+        }
+      }
+      
+      if (!pos && r.coords) {
+        pos = r.coords;
+      }
+      
+      if (pos) {
+        loadedPositions[r.id] = pos;
+      }
+    });
+    
+    setPositions(loadedPositions);
+  }, [responders, isClient]);
+
+  // Initialize map
+  useEffect(() => {
+    if (!isClient || !mapContainerRef.current || Object.keys(positions).length === 0) return;
+
+    // If map already exists, don't reinitialize
+    if (mapRef.current) {
+      updateMarkers();
+      return;
+    }
+
+    // Fix Leaflet default icon
+    delete (L.Icon.Default.prototype as any)._getIconUrl;
+    L.Icon.Default.mergeOptions({
+      iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
+      iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+      shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+    });
+
+    // Create map
+    const map = L.map(mapContainerRef.current, {
+      center: [33.7490, -84.3880],
+      zoom: 11,
+      scrollWheelZoom: true,
+    });
+
+    // Add tile layer
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+
+    mapRef.current = map;
+
+    // Add markers
+    updateMarkers();
+
+    // Cleanup function
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
+    };
+  }, [isClient, positions]);
+
+  // Update markers when responders change
+  useEffect(() => {
+    if (mapRef.current && Object.keys(positions).length > 0) {
+      updateMarkers();
+    }
+  }, [responders, positions, incident]);
+
+  const updateMarkers = () => {
+    if (!mapRef.current) return;
+
+    // Clear existing markers
+    markersRef.current.forEach(marker => marker.remove());
+    markersRef.current = [];
+
+    const bounds: L.LatLngBoundsLiteral = [];
+
+    // Add incident marker if exists
+    if (incident) {
+      const marker = L.marker([incident.lat, incident.lng])
+        .bindPopup(`
+          <strong>${incident.title}</strong><br />
+          Status: ${incident.status}<br />
+          Assigned: ${incident.assigned.length} responders
+        `)
+        .addTo(mapRef.current);
+      markersRef.current.push(marker);
+      bounds.push([incident.lat, incident.lng]);
+    }
+
+    // Add responder markers
+    Object.entries(positions).forEach(([id, loc]) => {
+      const responder = responders.find((r: Responder) => r.id === id);
+      if (!responder || !mapRef.current) return;
+
+      const marker = L.marker([loc.lat, loc.lng])
+        .bindPopup(`
+          <strong>${responder.name}</strong><br />
+          Type: ${responder.type}<br />
+          Status: ${responder.status}<br />
+          Location: ${loc.lat.toFixed(4)}, ${loc.lng.toFixed(4)}
+        `)
+        .addTo(mapRef.current);
+      
+      markersRef.current.push(marker);
+      bounds.push([loc.lat, loc.lng]);
+    });
+
+    // Fit bounds to show all markers
+    if (bounds.length > 0 && mapRef.current) {
+      mapRef.current.fitBounds(bounds, { padding: [50, 50] });
+    }
+  };
+
+  if (!isClient) {
+    return (
+      <div className="h-full bg-slate-700 rounded-lg flex items-center justify-center text-slate-400">
+        Loading map...
+      </div>
+    );
+  }
+
+  if (Object.keys(positions).length === 0) {
+    return (
+      <div className="h-full bg-slate-700 rounded-lg flex items-center justify-center text-slate-400">
+        No responder positions available
+      </div>
+    );
+  }
+
+  return (
+    <div 
+      ref={mapContainerRef} 
+      className="h-full w-full rounded-lg"
+      style={{ minHeight: '400px' }}
+    />
+  );
+}=== File: src/components/StatusBadge.tsx ===
+import React from 'react';
+import { CheckCircle, Activity, AlertCircle, XCircle } from 'lucide-react';
+
+interface StatusBadgeProps {
+  status: string;
+  size?: 'sm' | 'md' | 'lg';
+}
+
+export default function StatusBadge({ status, size = 'md' }: StatusBadgeProps) {
+  const getStatusColor = (status: string) => {
+    switch(status.toLowerCase()) {
+      case 'available': 
+      case 'standby': 
+        return 'bg-green-500';
+      case 'en-route': 
+      case 'active': 
+      case 'busy':
+        return 'bg-yellow-500';
+      case 'on-scene': 
+        return 'bg-red-500';
+      case 'offline':
+      case 'unavailable':
+        return 'bg-gray-500';
+      default: 
+        return 'bg-blue-500';
+    }
+  };
+
+  const getStatusIcon = (status: string) => {
+    const iconSize = size === 'sm' ? 'w-3 h-3' : size === 'lg' ? 'w-5 h-5' : 'w-4 h-4';
+    
+    switch(status.toLowerCase()) {
+      case 'available': 
+      case 'standby': 
+        return <CheckCircle className={iconSize} />;
+      case 'en-route': 
+      case 'active': 
+      case 'busy':
+        return <Activity className={iconSize} />;
+      case 'on-scene': 
+        return <AlertCircle className={iconSize} />;
+      default: 
+        return <XCircle className={iconSize} />;
+    }
+  };
+
+  const sizeClasses = {
+    sm: 'px-2 py-0.5 text-xs',
+    md: 'px-2 py-1 text-xs',
+    lg: 'px-3 py-1.5 text-sm'
+  };
+
+  return (
+    <div className={`flex items-center gap-1 ${getStatusColor(status)} ${sizeClasses[size]} rounded`}>
+      {getStatusIcon(status)}
+      <span className="capitalize font-medium">{status}</span>
+    </div>
+  );
+}=== File: src/components/Timeline.tsx ===
+=== File: src/data/responders.json ===
+[
+  {
+    "id": "FR-101",
+    "status": "Available",
+    "location": {
+      "lat": 33.931118648736806,
+      "lng": -84.33167731617658
+    },
+    "updatedAt": "2025-10-13T01:34:46.370Z"
+  },
+  {
+    "id": "FR-102",
+    "status": "active",
+    "location": null,
+    "updatedAt": "2025-10-12T23:57:42.833Z"
+  },
+  {
+    "id": "FR-103",
+    "status": "active",
+    "location": {
+      "lat": 33.931033508461965,
+      "lng": -84.33166010798195
+    },
+    "updatedAt": "2025-10-13T01:24:31.445Z"
+  },
+  {
+    "id": "FR-104",
+    "status": "Available",
+    "location": {
+      "lat": 33.931096690470504,
+      "lng": -84.3316843686623
+    },
+    "updatedAt": "2025-10-13T00:09:01.742Z"
+  },
+  {
+    "id": "FR-101%20%3E%20ALLOW%20GEOLOCATION%20%3E%20WAIT%2030S%20%3E%20REFRESH%20DASHBOARD%20%3E",
+    "status": "Available",
+    "location": {
+      "lat": 33.9310770137268,
+      "lng": -84.33167540033794
+    },
+    "updatedAt": "2025-10-13T00:14:20.375Z"
+  }
+]
+=== File: src/hooks/useRealTimeData.ts ===
+'use client';
+
+import { useState, useEffect } from 'react';
+import io, { Socket } from 'socket.io-client';
+import { DashboardData } from '../lib/types';
+
+export const useRealTimeData = () => {
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<DashboardData>({
+    ambulances: [
+      { id: 'AMB-001', status: 'available', location: 'Station 1', lastUpdate: '2 min ago' },
+      { id: 'AMB-002', status: 'en-route', location: 'Main St & 5th Ave', lastUpdate: '30 sec ago' },
+      { id: 'AMB-003', status: 'on-scene', location: 'City Park', lastUpdate: '1 min ago' },
+      { id: 'AMB-004', status: 'available', location: 'Station 2', lastUpdate: '5 min ago' },
+    ],
+    hospitals: [
+      { id: 'HSP-001', name: 'Central Medical', capacity: 85, available: 12, emergencyWait: '15 min' },
+      { id: 'HSP-002', name: 'St. Mary\'s Hospital', capacity: 120, available: 8, emergencyWait: '22 min' },
+      { id: 'HSP-003', name: 'Memorial Hospital', capacity: 95, available: 20, emergencyWait: '8 min' },
+    ],
+    firstResponders: [
+      { id: 'FR-101', name: 'Unit Alpha', type: 'Fire', status: 'active', location: 'Downtown' },
+      { id: 'FR-102', name: 'Unit Bravo', type: 'Police', status: 'active', location: 'North District' },
+      { id: 'FR-103', name: 'Unit Charlie', type: 'Fire', status: 'standby', location: 'Station 3' },
+      { id: 'FR-104', name: 'Unit Delta', type: 'Police', status: 'active', location: 'Highway 5' },
+    ],
+    timeline: [
+      { id: 1, time: '14:32:15', event: 'Ambulance AMB-002 dispatched to Main St & 5th Ave', type: 'dispatch' },
+      { id: 2, time: '14:30:08', event: '911 call received - Medical emergency reported', type: 'alert' },
+      { id: 3, time: '14:28:45', event: 'Unit Alpha completed fire suppression', type: 'complete' },
+      { id: 4, time: '14:25:12', event: 'Hospital capacity update - Memorial Hospital', type: 'update' },
+    ],
+    communications: [
+      { id: 1, from: 'Dispatch', to: 'AMB-002', message: 'Proceeding to scene, ETA 4 minutes', time: '14:32:30' },
+      { id: 2, from: 'Unit Alpha', to: 'Command', message: 'Fire under control, requesting medical support', time: '14:28:50' },
+      { id: 3, from: 'Central Medical', to: 'Dispatch', message: 'ER bed available, standing by', time: '14:27:15' },
+    ]
+  });
+
+  useEffect(() => {
+    // Initialize socket connection
+    const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:3001';
+    const socketInstance = io(socketUrl, {
+      transports: ['websocket'],
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+    });
+    
+    socketInstance.on('connect', () => {
+      console.log('✅ Connected to real-time server');
+      setLoading(false);
+    });
+
+    socketInstance.on('disconnect', () => {
+      console.log('❌ Disconnected from real-time server');
+    });
+
+    // Listen for ambulance updates
+    socketInstance.on('update:ambulances', (ambulances) => {
+      setData(prev => ({ ...prev, ambulances }));
+    });
+
+    // Listen for hospital updates
+    socketInstance.on('update:hospitals', (hospitals) => {
+      setData(prev => ({ ...prev, hospitals }));
+    });
+
+    // Listen for first responder updates
+    socketInstance.on('update:responders', (firstResponders) => {
+      setData(prev => ({ ...prev, firstResponders }));
+    });
+
+    // Listen for new timeline events
+    socketInstance.on('new:event', (event) => {
+      setData(prev => ({
+        ...prev,
+        timeline: [event, ...prev.timeline].slice(0, 50) // Keep last 50 events
+      }));
+    });
+
+    // Listen for new communications
+    socketInstance.on('new:communication', (comm) => {
+      setData(prev => ({
+        ...prev,
+        communications: [comm, ...prev.communications].slice(0, 50)
+      }));
+    });
+
+    // Error handling
+    socketInstance.on('connect_error', (error) => {
+      console.error('Connection error:', error);
+      setLoading(false);
+    });
+
+    setSocket(socketInstance);
+
+    // Cleanup on unmount
+    return () => {
+      socketInstance.disconnect();
+    };
+  }, []);
+
+  return { data, socket, loading };
+};=== File: src/lib/api.ts ===
+=== File: src/lib/auth.ts ===
+// lib/auth.ts
+// Authentication utilities and helpers
+
+import { randomBytes } from 'crypto';
+import bcrypt from 'bcryptjs';
+import { userQueries, sessionQueries, activityQueries } from './db';
+
+export interface User {
+  id: number;
+  username: string;
+  role: 'admin' | 'dispatcher' | 'hospital_worker' | 'first_responder' | 'user';
+  name: string;
+  email: string;
+  phone?: string;
+  organization?: string;
+  created_at: string;
+  last_login?: string;
+}
+
+export interface Session {
+  id: number;
+  user_id: number;
+  token: string;
+  expires_at: string;
+  created_at: string;
+}
+
+// Role permissions configuration
+export const ROLE_PERMISSIONS = {
+  admin: {
+    canAccessDashboard: true,
+    canManageHospitals: true,
+    canManageResponders: true,
+    canManageUsers: true,
+    canViewMap: true,
+    canViewReports: true,
+    canSendAlerts: true,
+    canReviewRequests: true,
+  },
+  dispatcher: {
+    canAccessDashboard: true,
+    canManageHospitals: false,
+    canManageResponders: true,
+    canManageUsers: false,
+    canViewMap: true,
+    canViewReports: true,
+    canSendAlerts: true,
+    canReviewRequests: true,
+  },
+  hospital_worker: {
+    canAccessDashboard: true,
+    canManageHospitals: true,
+    canManageResponders: false,
+    canManageUsers: false,
+    canViewMap: false,
+    canViewReports: false,
+    canSendAlerts: false,
+    canReviewRequests: false,
+  },
+  first_responder: {
+    canAccessDashboard: true,
+    canManageHospitals: false,
+    canManageResponders: false,
+    canManageUsers: false,
+    canViewMap: true,
+    canViewReports: false,
+    canSendAlerts: false,
+    canReviewRequests: false,
+  },
+  user: {
+    canAccessDashboard: true,
+    canManageHospitals: false,
+    canManageResponders: false,
+    canManageUsers: false,
+    canViewMap: false,
+    canViewReports: false,
+    canSendAlerts: false,
+    canReviewRequests: false,
+  },
+};
+
+// Generate a secure session token
+export function generateSessionToken(): string {
+  return randomBytes(32).toString('hex');
+}
+
+// Hash password
+export function hashPassword(password: string): string {
+  return bcrypt.hashSync(password, 10);
+}
+
+// Verify password
+export function verifyPassword(password: string, hash: string): boolean {
+  return bcrypt.compareSync(password, hash);
+}
+
+// Authenticate user
+export function authenticateUser(username: string, password: string): User | null {
+  const row: any = userQueries.findByUsername.get(username);
+  
+  if (!row) {
+    return null;
+  }
+  
+  if (!verifyPassword(password, row.password_hash)) {
+    return null;
+  }
+  
+  // Update last login
+  userQueries.updateLastLogin.run(row.id);
+  
+  // Remove password hash from returned user
+  const { password_hash, ...user } = row;
+  return user as User;
+}
+
+// Create session
+export function createSession(userId: number): string {
+  const token = generateSessionToken();
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
+  
+  sessionQueries.create.run(userId, token, expiresAt.toISOString());
+  
+  return token;
+}
+
+// Validate session
+export function validateSession(token: string): User | null {
+  if (!token) {
+    return null;
+  }
+  
+  const session: any = sessionQueries.findByToken.get(token);
+  
+  if (!session) {
+    return null;
+  }
+  
+  const user: any = userQueries.findById.get(session.user_id);
+  
+  if (!user) {
+    return null;
+  }
+  
+  const { password_hash, ...userWithoutPassword } = user;
+  return userWithoutPassword as User;
+}
+
+// Delete session (logout)
+export function deleteSession(token: string): void {
+  sessionQueries.deleteByToken.run(token);
+}
+
+// Delete all sessions for a user
+export function deleteUserSessions(userId: number): void {
+  sessionQueries.deleteByUserId.run(userId);
+}
+
+// Log activity
+export function logActivity(
+  userId: number | null,
+  action: string,
+  details?: string,
+  ipAddress?: string
+): void {
+  activityQueries.create.run(userId, action, details || null, ipAddress || null);
+}
+
+// Check if user has permission
+export function hasPermission(
+  user: User | null,
+  permission: keyof typeof ROLE_PERMISSIONS.admin
+): boolean {
+  if (!user) {
+    return false;
+  }
+  
+  const rolePermissions = ROLE_PERMISSIONS[user.role];
+  return rolePermissions[permission] || false;
+}
+
+// Get user by ID
+export function getUserById(id: number): User | null {
+  const row: any = userQueries.findById.get(id);
+  if (!row) {
+    return null;
+  }
+  const { password_hash, ...user } = row;
+  return user as User;
+}
+
+// Get all users
+export function getAllUsers(): User[] {
+  const rows: any[] = userQueries.getAll.all();
+  return rows;
+}
+
+// Create new user
+export function createUser(userData: {
+  username: string;
+  password: string;
+  role: User['role'];
+  name: string;
+  email: string;
+  phone?: string;
+  organization?: string;
+}): number {
+  const passwordHash = hashPassword(userData.password);
+  const result = userQueries.create.run(
+    userData.username,
+    passwordHash,
+    userData.role,
+    userData.name,
+    userData.email,
+    userData.phone || null,
+    userData.organization || null
+  );
+  return result.lastInsertRowid as number;
+}=== File: src/lib/AuthContext.tsx ===
+// lib/AuthContext.tsx
+'use client';
+
+import React, { createContext, useContext, useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+
+export interface User {
+  id: number;
+  username: string;
+  role: 'admin' | 'dispatcher' | 'hospital_worker' | 'first_responder' | 'user';
+  name: string;
+  email: string;
+  organization?: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+  loading: boolean;
+  login: (username: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
+  checkSession: () => Promise<void>;
+  hasPermission: (permission: string) => boolean;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const router = useRouter();
+
+  // Role permissions configuration
+  const ROLE_PERMISSIONS = {
+    admin: {
+      canAccessDashboard: true,
+      canManageHospitals: true,
+      canManageResponders: true,
+      canManageUsers: true,
+      canViewMap: true,
+      canViewReports: true,
+      canSendAlerts: true,
+      canReviewRequests: true,
+    },
+    dispatcher: {
+      canAccessDashboard: true,
+      canManageHospitals: false,
+      canManageResponders: true,
+      canManageUsers: false,
+      canViewMap: true,
+      canViewReports: true,
+      canSendAlerts: true,
+      canReviewRequests: true,
+    },
+    hospital_worker: {
+      canAccessDashboard: true,
+      canManageHospitals: true,
+      canManageResponders: false,
+      canManageUsers: false,
+      canViewMap: false,
+      canViewReports: false,
+      canSendAlerts: false,
+      canReviewRequests: false,
+    },
+    first_responder: {
+      canAccessDashboard: true,
+      canManageHospitals: false,
+      canManageResponders: false,
+      canManageUsers: false,
+      canViewMap: true,
+      canViewReports: false,
+      canSendAlerts: false,
+      canReviewRequests: false,
+    },
+    user: {
+      canAccessDashboard: true,
+      canManageHospitals: false,
+      canManageResponders: false,
+      canManageUsers: false,
+      canViewMap: false,
+      canViewReports: false,
+      canSendAlerts: false,
+      canReviewRequests: false,
+    },
+  };
+
+  // Check session on mount
+  useEffect(() => {
+    checkSession();
+  }, []);
+
+  const checkSession = async () => {
+    try {
+      const response = await fetch('/api/auth/session');
+      
+      if (response.ok) {
+        const data = await response.json();
+        setUser(data.user);
+      } else {
+        setUser(null);
+      }
+    } catch (error) {
+      console.error('Session check error:', error);
+      setUser(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const login = async (username: string, password: string) => {
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username, password }),
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Login failed');
+      }
+
+      const data = await response.json();
+      setUser(data.user);
+      router.push('/dashboard');
+    } catch (error) {
+      console.error('Login error:', error);
+      throw error;
+    }
+  };
+
+  const logout = async () => {
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+      });
+      
+      setUser(null);
+      router.push('/login');
+    } catch (error) {
+      console.error('Logout error:', error);
+    }
+  };
+
+  const hasPermission = (permission: string): boolean => {
+    if (!user) {
+      return false;
+    }
+    
+    const rolePermissions = ROLE_PERMISSIONS[user.role];
+    return (rolePermissions as any)[permission] || false;
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, loading, login, logout, checkSession, hasPermission }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+}=== File: src/lib/db.ts ===
+// lib/db.ts
+// SQLite database setup and utilities
+
+import Database from 'better-sqlite3';
+import path from 'path';
+import fs from 'fs';
+import bcrypt from 'bcryptjs';
+
+const dbPath = path.join(process.cwd(), 'data', 'crisis-management.db');
+
+// Ensure data directory exists
+const dataDir = path.dirname(dbPath);
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+// Initialize database
+const db = new Database(dbPath);
+
+// Enable foreign keys
+db.pragma('foreign_keys = ON');
+
+// Create tables
+export function initializeDatabase() {
+  // Users table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('admin', 'dispatcher', 'hospital_worker', 'first_responder', 'user')),
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      phone TEXT,
+      organization TEXT,
+      is_active INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_login DATETIME
+    )
+  `);
+
+  // Sessions table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token TEXT UNIQUE NOT NULL,
+      expires_at DATETIME NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Activity log table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS activity_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      action TEXT NOT NULL,
+      details TEXT,
+      ip_address TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+    )
+  `);
+
+  // Create indexes
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+    CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+  `);
+
+  console.log('✅ Database tables initialized');
+}
+
+// Seed sample users
+export function seedSampleUsers() {
+  const users = [
+    {
+      username: 'admin',
+      password: 'admin123',
+      role: 'admin',
+      name: 'System Administrator',
+      email: 'admin@crisis-mgmt.local',
+      phone: '555-0100',
+      organization: 'Crisis Management HQ'
+    },
+    {
+      username: 'dispatcher1',
+      password: 'dispatch123',
+      role: 'dispatcher',
+      name: 'Sarah Johnson',
+      email: 'sarah.j@dispatch.local',
+      phone: '555-0101',
+      organization: 'Central Dispatch'
+    },
+    {
+      username: 'hospital1',
+      password: 'hospital123',
+      role: 'hospital_worker',
+      name: 'Dr. Michael Chen',
+      email: 'mchen@central-medical.local',
+      phone: '555-0102',
+      organization: 'Central Medical Center'
+    },
+    {
+      username: 'responder1',
+      password: 'respond123',
+      role: 'first_responder',
+      name: 'Officer James Martinez',
+      email: 'jmartinez@firstresponse.local',
+      phone: '555-0103',
+      organization: 'Fire Department Unit Alpha'
+    },
+    {
+      username: 'user1',
+      password: 'user123',
+      role: 'user',
+      name: 'Emily Rodriguez',
+      email: 'emily.r@example.com',
+      phone: '555-0104',
+      organization: null
+    }
+  ];
+
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO users (username, password_hash, role, name, email, phone, organization)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  users.forEach(user => {
+    const passwordHash = bcrypt.hashSync(user.password, 10);
+    insert.run(
+      user.username,
+      passwordHash,
+      user.role,
+      user.name,
+      user.email,
+      user.phone,
+      user.organization
+    );
+  });
+
+  console.log('✅ Sample users seeded');
+}
+
+// Initialize database FIRST, before creating prepared statements
+initializeDatabase();
+seedSampleUsers();
+
+// NOW create prepared statements AFTER tables exist
+export const userQueries = {
+  findByUsername: db.prepare('SELECT * FROM users WHERE username = ? AND is_active = 1'),
+  findById: db.prepare('SELECT * FROM users WHERE id = ? AND is_active = 1'),
+  findByEmail: db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1'),
+  create: db.prepare(`
+    INSERT INTO users (username, password_hash, role, name, email, phone, organization)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `),
+  updateLastLogin: db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?'),
+  getAllByRole: db.prepare('SELECT * FROM users WHERE role = ? AND is_active = 1'),
+  getAll: db.prepare('SELECT id, username, role, name, email, phone, organization, created_at, last_login FROM users WHERE is_active = 1')
+};
+
+// Session queries
+export const sessionQueries = {
+  create: db.prepare('INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)'),
+  findByToken: db.prepare('SELECT * FROM sessions WHERE token = ? AND expires_at > CURRENT_TIMESTAMP'),
+  deleteByToken: db.prepare('DELETE FROM sessions WHERE token = ?'),
+  deleteExpired: db.prepare('DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP'),
+  deleteByUserId: db.prepare('DELETE FROM sessions WHERE user_id = ?')
+};
+
+// Activity log queries
+export const activityQueries = {
+  create: db.prepare('INSERT INTO activity_log (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)'),
+  getByUserId: db.prepare('SELECT * FROM activity_log WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'),
+  getRecent: db.prepare('SELECT * FROM activity_log ORDER BY created_at DESC LIMIT ?')
+};
+
+// Cleanup function
+export function cleanupExpiredSessions() {
+  const result = sessionQueries.deleteExpired.run();
+  console.log(`🧹 Cleaned up ${result.changes} expired sessions`);
+  return result.changes;
+}
+
+export default db;=== File: src/lib/hospitalDataStore.ts ===
+// lib/hospitalDataStore.ts
+// Client-side storage for hospital resource data
+
+export interface HospitalData {
+  id?: string;
+  name: string;
+  hospitalName?: string; // alias for compatibility
+  totalBeds: number;
+  availableBeds: number;
+  availableICU: number;
+  ventilators: number;
+  lastUpdated: string;
+}
+
+const STORAGE_KEY = 'hospital_data';
+let listeners: Array<(data: HospitalData[]) => void> = [];
+
+// Initialize with default data if empty
+const defaultHospitals: HospitalData[] = [
+  {
+    id: 'HSP-001',
+    name: 'Central Medical',
+    totalBeds: 85,
+    availableBeds: 12,
+    availableICU: 5,
+    ventilators: 8,
+    lastUpdated: new Date().toISOString(),
+  },
+  {
+    id: 'HSP-002',
+    name: "St. Mary's Hospital",
+    totalBeds: 120,
+    availableBeds: 8,
+    availableICU: 3,
+    ventilators: 5,
+    lastUpdated: new Date().toISOString(),
+  },
+  {
+    id: 'HSP-003',
+    name: 'Memorial Hospital',
+    totalBeds: 95,
+    availableBeds: 20,
+    availableICU: 8,
+    ventilators: 12,
+    lastUpdated: new Date().toISOString(),
+  },
+];
+
+// Get hospital data from localStorage
+export function getHospitalData(): HospitalData[] {
+  if (typeof window === 'undefined') return defaultHospitals;
+  
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      // Add IDs if missing
+      return parsed.map((h: HospitalData, idx: number) => ({
+        ...h,
+        id: h.id || `HSP-${String(idx + 1).padStart(3, '0')}`,
+        hospitalName: h.hospitalName || h.name, // compatibility
+      }));
+    }
+  } catch (e) {
+    console.error('Error loading hospital data:', e);
+  }
+  
+  // Initialize with defaults
+  saveHospitalData(defaultHospitals);
+  return defaultHospitals;
+}
+
+// Save hospital data to localStorage
+export function saveHospitalData(data: HospitalData[]): void {
+  if (typeof window === 'undefined') return;
+  
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    notifyListeners(data);
+  } catch (e) {
+    console.error('Error saving hospital data:', e);
+  }
+}
+
+// Subscribe to hospital data changes
+export function onHospitalDataChange(callback: (data: HospitalData[]) => void): () => void {
+  listeners.push(callback);
+  
+  // Return unsubscribe function
+  return () => {
+    listeners = listeners.filter((l) => l !== callback);
+  };
+}
+
+// Notify all listeners of data change
+function notifyListeners(data: HospitalData[]): void {
+  listeners.forEach((callback) => callback(data));
+}
+
+// Update a specific hospital
+export function updateHospital(hospitalName: string, updates: Partial<HospitalData>): void {
+  const hospitals = getHospitalData();
+  const index = hospitals.findIndex(
+    (h) => h.name.toLowerCase() === hospitalName.toLowerCase()
+  );
+  
+  if (index !== -1) {
+    hospitals[index] = {
+      ...hospitals[index],
+      ...updates,
+      lastUpdated: new Date().toISOString(),
+    };
+    saveHospitalData(hospitals);
+  }
+}
+
+// Clear all hospital data (useful for testing)
+export function clearHospitalData(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(STORAGE_KEY);
+  notifyListeners([]);
+}=== File: src/lib/performance.ts ===
+=== File: src/lib/resourceRequestStore.ts ===
+// lib/resourceRequestStore.ts
+// Client-side storage for resource requests
+
+export interface ResourceRequest {
+  id: string;
+  hospitalName: string;
+  resourceType: string;
+  quantity: number;
+  priority: string;
+  status: 'pending' | 'approved' | 'denied';
+  timestamp: string;
+}
+
+const STORAGE_KEY = 'resource_requests';
+let listeners: Array<(data: ResourceRequest[]) => void> = [];
+
+// Get all resource requests
+export function getResourceRequests(): ResourceRequest[] {
+  if (typeof window === 'undefined') return [];
+  
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    return stored ? JSON.parse(stored) : [];
+  } catch (e) {
+    console.error('Error loading resource requests:', e);
+    return [];
+  }
+}
+
+// Save resource requests to localStorage
+function saveResourceRequests(requests: ResourceRequest[]): void {
+  if (typeof window === 'undefined') return;
+  
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(requests));
+    notifyListeners(requests);
+  } catch (e) {
+    console.error('Error saving resource requests:', e);
+  }
+}
+
+// Add a new resource request
+export function addResourceRequest(
+  request: Omit<ResourceRequest, 'id' | 'status' | 'timestamp'>
+): void {
+  const requests = getResourceRequests();
+  
+  const newRequest: ResourceRequest = {
+    ...request,
+    id: `REQ-${Date.now()}`,
+    status: 'pending',
+    timestamp: new Date().toISOString(),
+  };
+  
+  requests.push(newRequest);
+  saveResourceRequests(requests);
+}
+
+// Approve a resource request
+export function approveResourceRequest(id: string): void {
+  const requests = getResourceRequests();
+  const index = requests.findIndex((r) => r.id === id);
+  
+  if (index !== -1) {
+    requests[index].status = 'approved';
+    
+    // Update hospital data with approved resources
+    const request = requests[index];
+    updateHospitalResources(request);
+    
+    // Remove from pending requests
+    requests.splice(index, 1);
+    saveResourceRequests(requests);
+  }
+}
+
+// Deny a resource request
+export function denyResourceRequest(id: string): void {
+  const requests = getResourceRequests();
+  const index = requests.findIndex((r) => r.id === id);
+  
+  if (index !== -1) {
+    requests[index].status = 'denied';
+    
+    // Remove from pending requests
+    requests.splice(index, 1);
+    saveResourceRequests(requests);
+  }
+}
+
+// Update hospital resources when request is approved
+function updateHospitalResources(request: ResourceRequest): void {
+  // Import dynamically to avoid circular dependency
+  if (typeof window === 'undefined') return;
+  
+  try {
+    const { getHospitalData, saveHospitalData } = require('./hospitalDataStore');
+    const hospitals = getHospitalData();
+    
+    const hospitalIndex = hospitals.findIndex(
+      (h: any) => h.name === request.hospitalName || h.hospitalName === request.hospitalName
+    );
+    
+    if (hospitalIndex !== -1) {
+      const hospital = hospitals[hospitalIndex];
+      
+      // Map resource type to hospital field
+      const resourceMap: Record<string, string> = {
+        'Beds': 'availableBeds',
+        'beds': 'availableBeds',
+        'ICU': 'availableICU',
+        'icu': 'availableICU',
+        'Ventilators': 'ventilators',
+        'ventilators': 'ventilators',
+      };
+      
+      const fieldName = resourceMap[request.resourceType] || request.resourceType;
+      
+      if (fieldName in hospital) {
+        hospital[fieldName] = (hospital[fieldName] || 0) + request.quantity;
+        hospital.lastUpdated = new Date().toISOString();
+        saveHospitalData(hospitals);
+      }
+    }
+  } catch (e) {
+    console.error('Error updating hospital resources:', e);
+  }
+}
+
+// Subscribe to request data changes
+export function onRequestDataChange(callback: (data: ResourceRequest[]) => void): () => void {
+  listeners.push(callback);
+  
+  // Return unsubscribe function
+  return () => {
+    listeners = listeners.filter((l) => l !== callback);
+  };
+}
+
+// Notify all listeners of data change
+function notifyListeners(data: ResourceRequest[]): void {
+  listeners.forEach((callback) => callback(data));
+}
+
+// Clear all requests (useful for testing)
+export function clearResourceRequests(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(STORAGE_KEY);
+  notifyListeners([]);
+}=== File: src/lib/socket.ts ===
+=== File: src/lib/types.ts ===
+// Core types for Crisis Management Dashboard
+
+export type SeverityLevel = 'critical' | 'high' | 'medium' | 'low';
+export type IncidentStatus = 'active' | 'responding' | 'resolved';
+export type ResponderStatus = 'active' | 'standby' | 'unavailable';
+export type ResponderType = 'Fire' | 'Police' | 'Medical' | 'EMS';
+export type AlertType = 'earthquake' | 'flood' | 'fire' | 'hurricane' | 'tornado' | 'amber' | 'silver' | 'other';
+export type AlertSeverity = 'extreme' | 'severe' | 'moderate' | 'minor';
+export type ResourceStatus = 'available' | 'en-route' | 'on-scene' | 'standby' | 'active';
+
+// Coordinates interface
+export interface Coordinates {
+  lat: number;
+  lng: number;
+}
+
+// Ambulance Type (from your actual code)
+export interface AmbulanceType {
+  id: string;
+  status: 'available' | 'en-route' | 'on-scene';
+  location: string;
+  lastUpdate: string;
+  coords?: Coordinates;
+  vehicleId?: string;
+  medicalEquipment?: string[];
+  paramedics?: number;
+  patientCapacity?: number;
+}
+
+// Hospital Type (from your actual code)
+export interface HospitalType {
+  id: string;
+  name: string;
+  capacity: number;
+  available: number;
+  emergencyWait: string;
+  coords?: Coordinates;
+  specialties?: string[];
+  distance?: string;
+  status?: 'operational' | 'limited' | 'full';
+}
+
+// First Responder Type (from your actual code)
+export interface FirstResponderType {
+  id: string;
+  name: string;
+  type: 'Fire' | 'Police';
+  status: 'active' | 'standby';
+  location: string;
+  coords?: { lat: number; lng: number };
+  assignedIncident?: string;
+  eta?: string;
+  lastUpdate?: string;
+}
+
+// Timeline Event Type (from your actual code)
+export interface TimelineEventType {
+  id: number;
+  time: string;
+  event: string;
+  type: 'alert' | 'dispatch' | 'complete' | 'update';
+}
+
+// Communication Type (from your actual code)
+export interface CommunicationType {
+  id: number;
+  from: string;
+  to: string;
+  message: string;
+  time: string;
+  timestamp?: number;
+  priority?: 'high' | 'normal' | 'low';
+  read?: boolean;
+}
+
+// Dashboard Data Type (from your actual code)
+export interface DashboardData {
+  ambulances: AmbulanceType[];
+  hospitals: HospitalType[];
+  firstResponders: FirstResponderType[];
+  timeline: TimelineEventType[];
+  communications: CommunicationType[];
+}
+
+// Incident interface
+export interface Incident {
+  id: string;
+  title: string;
+  type: string;
+  severity: SeverityLevel;
+  status: IncidentStatus;
+  location: string;
+  coords: Coordinates;
+  time: string;
+  description?: string;
+  assignedUnits?: string[];
+  reportedBy?: string;
+  estimatedResolution?: string;
+}
+
+// Resource data for charts
+export interface ResourceChartData {
+  name: string;
+  value: number;
+  status: ResourceStatus;
+  available?: number;
+  deployed?: number;
+  total?: number;
+}
+
+// Government Alert (from AlertSystem component)
+export interface GovernmentAlert {
+  id: number;
+  timestamp: string;
+  message: string;
+  priority: 'normal' | 'urgent';
+  agency: string;
+  type?: AlertType;
+  severity?: AlertSeverity;
+  area?: string;
+  expires?: string;
+  issued?: string;
+  source?: string;
+  instructions?: string;
+  coords?: Coordinates;
+  affectedPopulation?: number;
+}
+
+// Real-time update for websocket
+export interface RealtimeUpdate {
+  type: 'incident' | 'responder' | 'hospital' | 'alert' | 'ambulance' | 'communication';
+  action: 'create' | 'update' | 'delete';
+  data: Incident | FirstResponderType | HospitalType | GovernmentAlert | AmbulanceType | CommunicationType;
+  timestamp: number;
+}
+
+// Dashboard metrics
+export interface DashboardMetrics {
+  activeIncidents: number;
+  resolvedIncidents: number;
+  activeResponders: number;
+  availableBeds: number;
+  criticalAlerts: number;
+  averageResponseTime: string;
+}
+
+// Filter options for incidents
+export interface IncidentFilters {
+  severity?: SeverityLevel[];
+  status?: IncidentStatus[];
+  type?: string[];
+  dateRange?: {
+    start: Date;
+    end: Date;
+  };
+  location?: string;
+}
+
+// User/Operator information
+export interface Operator {
+  id: string;
+  name: string;
+  role: 'dispatcher' | 'supervisor' | 'admin';
+  station: string;
+  status: 'online' | 'offline' | 'busy';
+  lastActivity?: string;
+}
+
+// Notification
+export interface Notification {
+  id: string;
+  type: 'info' | 'warning' | 'error' | 'success';
+  title: string;
+  message: string;
+  timestamp: number;
+  read: boolean;
+  actionUrl?: string;
+}
+
+// API Response wrapper
+export interface ApiResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  timestamp: number;
+}
+
+// Pagination
+export interface PaginatedResponse<T> {
+  data: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+}
+
+// GeoLocation interface (used in responder pages)
+export interface GeoLocation {
+  lat: number | null;
+  lng: number | null;
+}
+
+// Responder API Update
+export interface ResponderUpdate {
+  id: string;
+  status: 'standby' | 'active';
+  location: { lat: number; lng: number } | null;
+  updatedAt: string;
+}=== File: src/services/communicationService.ts ===
+import { CommunicationType } from '@/lib/types';
+import { Socket } from 'socket.io-client';
+
+class CommunicationService {
+  private socket: Socket | null = null;
+  private messages: CommunicationType[] = [];
+
+  setSocket(socket: Socket) {
+    this.socket = socket;
+  }
+
+  sendMessage(from: string, to: string, message: string) {
+    if (!this.socket) {
+      console.error('Socket not initialized');
+      return;
+    }
+
+    const newMessage: CommunicationType = {
+      id: Date.now(),
+      from,
+      to,
+      message,
+      time: new Date().toLocaleTimeString()
+    };
+
+    this.socket.emit('send:message', newMessage);
+    this.messages.unshift(newMessage);
+
+    return newMessage;
+  }
+
+  receiveMessage(message: CommunicationType) {
+    this.messages.unshift(message);
+  }
+
+  getMessages() {
+    return this.messages;
+  }
+
+  getMessagesByUnit(unitId: string) {
+    return this.messages.filter(
+      msg => msg.from === unitId || msg.to === unitId
+    );
+  }
+
+  clearMessages() {
+    this.messages = [];
+  }
+}
+
+export const communicationService = new CommunicationService();=== File: src/services/eventLogger.ts ===
