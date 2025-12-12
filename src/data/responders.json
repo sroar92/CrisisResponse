@@ -1,0 +1,44 @@
+[
+  {
+    "id": "FR-101",
+    "status": "Available",
+    "location": {
+      "lat": 33.931118648736806,
+      "lng": -84.33167731617658
+    },
+    "updatedAt": "2025-10-13T01:34:46.370Z"
+  },
+  {
+    "id": "FR-102",
+    "status": "active",
+    "location": null,
+    "updatedAt": "2025-10-12T23:57:42.833Z"
+  },
+  {
+    "id": "FR-103",
+    "status": "active",
+    "location": {
+      "lat": 33.931033508461965,
+      "lng": -84.33166010798195
+    },
+    "updatedAt": "2025-10-13T01:24:31.445Z"
+  },
+  {
+    "id": "FR-104",
+    "status": "Available",
+    "location": {
+      "lat": 33.931096690470504,
+      "lng": -84.3316843686623
+    },
+    "updatedAt": "2025-10-13T00:09:01.742Z"
+  },
+  {
+    "id": "FR-101%20%3E%20ALLOW%20GEOLOCATION%20%3E%20WAIT%2030S%20%3E%20REFRESH%20DASHBOARD%20%3E",
+    "status": "Available",
+    "location": {
+      "lat": 33.9310770137268,
+      "lng": -84.33167540033794
+    },
+    "updatedAt": "2025-10-13T00:14:20.375Z"
+  }
+]
